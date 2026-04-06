@@ -715,8 +715,10 @@ if [ "$DIRECT_MODE" = false ]; then
     step 5 14 "Discover Agents"
 
     BOTS_JSON_FILE=$(mktemp)
-    run_sf org list metadata --metadata-type Bot --target-org "$ORG" --json > "$BOTS_JSON_FILE" 2>/dev/null &
-    spinner $! "Listing agents in org..."
+    run_sf data query \
+        --query "SELECT Id, DeveloperName, MasterLabel FROM BotDefinition WHERE Status = 'Active' ORDER BY MasterLabel ASC" \
+        --target-org "$ORG" --json > "$BOTS_JSON_FILE" 2>/dev/null &
+    spinner $! "Listing active agents in org..."
 
     BOTS_JSON=$(cat "$BOTS_JSON_FILE")
     rm -f "$BOTS_JSON_FILE"
@@ -725,12 +727,12 @@ if [ "$DIRECT_MODE" = false ]; then
 import sys, json
 try:
     d = json.load(sys.stdin)
-    items = d.get('result', [])
-    if not items:
+    records = d.get('result', {}).get('records', [])
+    if not records:
         sys.exit(0)
-    for item in items:
-        fn = item.get('fullName', '')
-        fid = item.get('id', '')
+    for rec in records:
+        fn = rec.get('DeveloperName', '')
+        fid = rec.get('Id', '')
         if fn:
             print(f'{fn}|{fid}')
 except Exception as e:
@@ -738,7 +740,7 @@ except Exception as e:
 " 2>/dev/null)
 
     if [ -z "$BOTS_PARSED" ]; then
-        die "No agents found in this org. Make sure you have at least one Einstein Bot / Agentforce agent."
+        die "No active agents found in this org. Make sure you have at least one active Agentforce agent."
     fi
 
     AGENT_NAMES=()
