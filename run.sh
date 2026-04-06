@@ -39,8 +39,9 @@ LOGIN_URL=""
 ORG_USERNAME=""
 ORG_INSTANCE=""
 AGENT_NAME=""
-AGENT_NAMES=()          # all discovered agent fullNames
+AGENT_NAMES=()          # all discovered agent fullNames (DeveloperName)
 AGENT_IDS=()            # all discovered agent ids
+AGENT_LABELS=()         # all discovered agent MasterLabels
 TOPIC_DEVNAMES=()       # all discovered topic devnames
 TOPIC_LABELS=()         # all discovered topic masterLabels
 TOPIC_DESCS=()          # all discovered topic descriptions
@@ -746,15 +747,14 @@ if [ "$DIRECT_MODE" = false ]; then
 
     BOTS_JSON_FILE=$(mktemp)
     run_sf data query \
-        --query "SELECT Id, DeveloperName, MasterLabel, Status, LastModifiedDate FROM BotDefinition WHERE Status IN ('Active','Draft') ORDER BY LastModifiedDate DESC" \
+        --query "SELECT Id, DeveloperName, MasterLabel, LastModifiedDate FROM BotDefinition ORDER BY LastModifiedDate DESC" \
         --target-org "$ORG" --json > "$BOTS_JSON_FILE" 2>/dev/null &
     spinner $! "Listing agents in org..."
 
     BOTS_JSON=$(cat "$BOTS_JSON_FILE")
     rm -f "$BOTS_JSON_FILE"
 
-    _parse_bots() {
-        echo "$1" | python3 -c "
+    BOTS_PARSED=$(echo "$BOTS_JSON" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -763,32 +763,16 @@ try:
         sys.exit(0)
     seen = {}
     for rec in records:
-        fn     = rec.get('DeveloperName', '')
-        fid    = rec.get('Id', '')
-        status = rec.get('Status', '')
+        fn  = rec.get('DeveloperName', '')
+        fid = rec.get('Id', '')
+        lbl = rec.get('MasterLabel', fn)
         if fn and fn not in seen:
-            seen[fn] = (fid, status)
-    for fn, (fid, status) in seen.items():
-        print(f'{fn}|{fid}|{status}')
+            seen[fn] = (fid, lbl)
+    for fn, (fid, lbl) in seen.items():
+        print(f'{fn}|{fid}|{lbl}')
 except Exception as e:
     print(f'ERROR|{e}', file=sys.stderr)
-" 2>/dev/null
-    }
-
-    BOTS_PARSED=$(_parse_bots "$BOTS_JSON")
-
-    # Fallback: if status-filtered query returned nothing, try all bots
-    if [ -z "$BOTS_PARSED" ]; then
-        info "No Active/Draft agents found — querying all agents in org..."
-        BOTS_JSON_FILE2=$(mktemp)
-        run_sf data query \
-            --query "SELECT Id, DeveloperName, MasterLabel, Status, LastModifiedDate FROM BotDefinition ORDER BY LastModifiedDate DESC" \
-            --target-org "$ORG" --json > "$BOTS_JSON_FILE2" 2>/dev/null &
-        spinner $! "Listing all agents..."
-        BOTS_JSON=$( cat "$BOTS_JSON_FILE2")
-        rm -f "$BOTS_JSON_FILE2"
-        BOTS_PARSED=$(_parse_bots "$BOTS_JSON")
-    fi
+" 2>/dev/null)
 
     if [ -z "$BOTS_PARSED" ]; then
         die "No agents found in this org. Make sure you have at least one Agentforce agent deployed."
@@ -796,24 +780,17 @@ except Exception as e:
 
     AGENT_NAMES=()
     AGENT_IDS=()
-    AGENT_STATUSES=()
-    while IFS='|' read -r name fid status; do
+    AGENT_LABELS=()
+    while IFS='|' read -r name fid lbl; do
         AGENT_NAMES+=("$name")
         AGENT_IDS+=("$fid")
-        AGENT_STATUSES+=("$status")
+        AGENT_LABELS+=("$lbl")
     done <<< "$BOTS_PARSED"
 
     echo ""
     echo -e "  ${BOLD}Available Agents:${NC} ${DIM}(ordered by last modified — most recent first)${NC}"
     for i in "${!AGENT_NAMES[@]}"; do
-        status="${AGENT_STATUSES[$i]}"
-        case "$status" in
-            Active)    status_tag="${GREEN}Active${NC}" ;;
-            Draft)     status_tag="${YELLOW}Draft${NC}" ;;
-            Committed) status_tag="${CYAN}Committed${NC}" ;;
-            *)         status_tag="${DIM}${status}${NC}" ;;
-        esac
-        printf "    ${BOLD}%d)${NC} %-40s ${DIM}[${NC}${status_tag}${DIM}]${NC}\n" "$((i+1))" "${AGENT_NAMES[$i]}"
+        printf "    ${BOLD}%d)${NC} %s ${DIM}(%s)${NC}\n" "$((i+1))" "${AGENT_LABELS[$i]}" "${AGENT_NAMES[$i]}"
     done
 
     # ── Step 6: Select ───────────────────────────────────────────────────
