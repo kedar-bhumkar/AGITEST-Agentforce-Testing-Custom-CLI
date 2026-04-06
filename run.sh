@@ -90,7 +90,7 @@ for k, v in s.items():
         safe = str(v).replace("'", "'\\''")
         print(f"export {k}='{safe}'")
 PYLASTRUN
-)"
+| tr -d '\r')"
                 # Map saved keys back to script variables
                 [ -n "${LR_ORG:-}"              ] && ORG="$LR_ORG"
                 [ -n "${LR_AGENT_NAME:-}"       ] && DIRECT_BOT="$LR_AGENT_NAME"
@@ -546,12 +546,14 @@ if [ "$DIRECT_MODE" = false ]; then
             # Try last run as hint
             _saved_key=""
             if [ -f "$LAST_RUN_FILE" ]; then
-                _saved_key=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_KEY',''))" "$LAST_RUN_FILE" 2>/dev/null)
+                # tr -d '\r' strips Windows CR that Python print() adds on Windows
+                _saved_key=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_KEY',''), end='')" "$LAST_RUN_FILE" 2>/dev/null | tr -d '\r')
             fi
             _hint=""
             [ -n "$_saved_key" ] && _hint=" ${DIM}[saved: ${_saved_key:0:8}… — press ENTER to reuse]${NC}"
             echo -e "  Enter Consumer Key:${_hint}"
             read -p "  > " _key_input
+            _key_input=$(echo "$_key_input" | tr -d '\r')
             if [ -z "$_key_input" ] && [ -n "$_saved_key" ]; then
                 AGENT_API_CONSUMER_KEY="$_saved_key"
                 info "Using saved Consumer Key."
@@ -566,13 +568,15 @@ if [ "$DIRECT_MODE" = false ]; then
             # Try last run as hint
             _saved_secret=""
             if [ -f "$LAST_RUN_FILE" ]; then
-                _saved_secret=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_SECRET',''))" "$LAST_RUN_FILE" 2>/dev/null)
+                # tr -d '\r' strips Windows CR that Python print() adds on Windows
+                _saved_secret=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_SECRET',''), end='')" "$LAST_RUN_FILE" 2>/dev/null | tr -d '\r')
             fi
             _hint=""
             [ -n "$_saved_secret" ] && _hint=" ${DIM}[saved — press ENTER to reuse]${NC}"
             echo -e "  Enter Consumer Secret:${_hint}"
             read -sp "  > " _secret_input
             echo ""
+            _secret_input=$(echo "$_secret_input" | tr -d '\r')
             if [ -z "$_secret_input" ] && [ -n "$_saved_secret" ]; then
                 AGENT_API_CONSUMER_SECRET="$_saved_secret"
                 info "Using saved Consumer Secret."
@@ -742,7 +746,7 @@ if [ "$DIRECT_MODE" = false ]; then
 
     BOTS_JSON_FILE=$(mktemp)
     run_sf data query \
-        --query "SELECT Id, DeveloperName, MasterLabel, Status, LastModifiedDate FROM BotDefinition WHERE Status IN ('Active','Draft','Committed') ORDER BY LastModifiedDate DESC" \
+        --query "SELECT Id, DeveloperName, MasterLabel, Status, LastModifiedDate FROM BotDefinition WHERE Status IN ('Active','Draft') ORDER BY LastModifiedDate DESC" \
         --target-org "$ORG" --json > "$BOTS_JSON_FILE" 2>/dev/null &
     spinner $! "Listing agents in org..."
 
@@ -772,7 +776,7 @@ except Exception as e:
 " 2>/dev/null)
 
     if [ -z "$BOTS_PARSED" ]; then
-        die "No agents found in this org. Make sure you have at least one Agentforce agent (Active, Draft, or Committed)."
+        die "No agents found in this org. Make sure you have at least one Agentforce agent (Active or Draft status)."
     fi
 
     AGENT_NAMES=()
