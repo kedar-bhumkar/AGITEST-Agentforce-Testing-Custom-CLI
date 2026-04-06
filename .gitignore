@@ -1,0 +1,14 @@
+# Secrets & credentials
+.env
+.env.*
+
+# Runtime state (contains API keys from last run)
+.last_org
+.last_run.json
+
+# Logs & results (generated output, not source)
+*.log
+results/
+
+# Claude Code internal
+.claude/
