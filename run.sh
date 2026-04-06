@@ -1031,6 +1031,7 @@ else
 fi
 
 declare -A TOPIC_EXTRA_DETAILS
+declare -A TOPIC_CONTEXT_VARS   # JSON array of {name,type,value} per topic idx
 
 if [ "$DIRECT_MODE" = false ]; then
     # ── Interactive topic selection ──────────────────────────────────────
@@ -1113,6 +1114,46 @@ ${line}"
             ok "  Saved extra details for ${label}."
         else
             info "  No extra details for ${label} — will use description only."
+        fi
+
+        # ── Collect mutable context variables for this topic ──────────────
+        echo ""
+        echo -e "  ${BOLD}Add mutable context variables for ${label}?${NC} ${DIM}(injected into every test case)${NC}"
+        read -p "  Add context variables? (y/n): " vars_choice
+        TOPIC_CONTEXT_VARS[$idx]="[]"
+
+        if [[ "$vars_choice" =~ ^[yY] ]]; then
+            echo -e "  ${DIM}Supported types: Text, Number, Boolean, Date, DateTime, Currency, Id${NC}"
+            echo -e "  ${DIM}Leave variable name empty to finish.${NC}"
+            vars_json="["
+            first_var=true
+            while true; do
+                echo ""
+                read -p "    Variable name (or ENTER to finish): " vname
+                [ -z "$vname" ] && break
+
+                read -p "    Type [default: Text]: " vtype
+                [ -z "$vtype" ] && vtype="Text"
+
+                read -p "    Default value: " vvalue
+
+                [ "$first_var" = false ] && vars_json="${vars_json},"
+                # Escape double-quotes for JSON safety
+                vname_esc="${vname//\"/\\\"}"
+                vtype_esc="${vtype//\"/\\\"}"
+                vvalue_esc="${vvalue//\"/\\\"}"
+                vars_json="${vars_json}{\"name\":\"${vname_esc}\",\"type\":\"${vtype_esc}\",\"value\":\"${vvalue_esc}\"}"
+                first_var=false
+                ok "    + ${vname} (${vtype}) = \"${vvalue}\""
+            done
+            vars_json="${vars_json}]"
+            TOPIC_CONTEXT_VARS[$idx]="$vars_json"
+
+            # Count vars
+            var_count=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$vars_json" 2>/dev/null || echo "?")
+            ok "  ${var_count} context variable(s) saved for ${label}. Will be added to every test case."
+        else
+            info "  No context variables for ${label}."
         fi
         echo ""
     done
@@ -1360,13 +1401,17 @@ if [ "$GENERATE_TESTS" = true ]; then
         EXTRA_FILE=$(mktemp)
         printf '%s' "$t_extra" > "$EXTRA_FILE"
 
+        # Pass context variables via a temp file (JSON array)
+        VARS_FILE=$(mktemp)
+        printf '%s' "${TOPIC_CONTEXT_VARS[$idx]:-[]}" > "$VARS_FILE"
+
         if [ "$GEN_ENGINE" = "llm" ]; then
             # ────────────────────────────────────────────────────────────────
             # LLM-POWERED GENERATION (Claude API)
             # ────────────────────────────────────────────────────────────────
-            info "Generating via Claude API: $suite_name ($NUM_TESTS tests)..."
+            info "Generating via $GEN_LLM_PROVIDER: $suite_name ($NUM_TESTS tests)..."
 
-            python3 - "$AGENT_NAME" "$t_devname" "$t_label" "$t_desc" "$t_scope" "$NUM_TESTS" "$xml_file" "$suite_name" "$EXTRA_FILE" "$GEN_LLM_PROVIDER" "$GEN_LLM_API_KEY" "$GEN_LLM_MODEL" "${OLLAMA_URL:-http://localhost:11434}" << 'PYLLM'
+            python3 - "$AGENT_NAME" "$t_devname" "$t_label" "$t_desc" "$t_scope" "$NUM_TESTS" "$xml_file" "$suite_name" "$EXTRA_FILE" "$GEN_LLM_PROVIDER" "$GEN_LLM_API_KEY" "$GEN_LLM_MODEL" "${OLLAMA_URL:-http://localhost:11434}" "$VARS_FILE" << 'PYLLM'
 import sys, json, html, urllib.request, urllib.error, time, io, os
 
 # Force UTF-8 on Windows
@@ -1386,9 +1431,19 @@ provider      = sys.argv[10]
 api_key       = sys.argv[11]
 model         = sys.argv[12]
 ollama_url    = sys.argv[13]
+vars_file     = sys.argv[14] if len(sys.argv) > 14 else None
 
 with open(extra_file, 'r', encoding='utf-8') as f:
     extra_details = f.read().strip()
+
+# Load topic-level context variables (injected into every test case)
+topic_vars = []
+if vars_file:
+    try:
+        with open(vars_file, 'r', encoding='utf-8') as f:
+            topic_vars = json.load(f) or []
+    except Exception:
+        topic_vars = []
 
 # ── Build the shared prompt ───────────────────────────────────────────────
 scope_line = f"- Topic Scope: {topic_scope}" if topic_scope else ""
@@ -1565,8 +1620,11 @@ for i, tc in enumerate(test_cases, 1):
     xml_lines.append('        </expectation>')
     xml_lines.append('        <inputs>')
     xml_lines.append(f'            <utterance>{html.escape(utterance)}</utterance>')
-    # Write context variables if the LLM provided any for this test case
-    for var in tc_vars:
+    # Merge topic-level vars (user-defined) + any per-test vars from LLM
+    # Topic vars take precedence; LLM vars fill in anything not already named
+    topic_var_names = {v.get("name", "") for v in topic_vars}
+    all_vars = list(topic_vars) + [v for v in tc_vars if v.get("name", "") not in topic_var_names]
+    for var in all_vars:
         vname  = html.escape(str(var.get("name",  "")))
         vtype  = html.escape(str(var.get("type",  "Text")))
         vvalue = html.escape(str(var.get("value", "")))
@@ -1601,18 +1659,28 @@ PYLLM
             # ────────────────────────────────────────────────────────────────
             info "Generating via templates: $suite_name ($NUM_TESTS tests)..."
 
-            python3 - "$AGENT_NAME" "$t_devname" "$t_label" "$t_desc" "$t_scope" "$NUM_TESTS" "$xml_file" "$suite_name" "$EXTRA_FILE" << 'PYGEN'
-import sys, random, re, html, os
+            python3 - "$AGENT_NAME" "$t_devname" "$t_label" "$t_desc" "$t_scope" "$NUM_TESTS" "$xml_file" "$suite_name" "$EXTRA_FILE" "$VARS_FILE" << 'PYGEN'
+import sys, random, re, html, os, json
 
-agent_name   = sys.argv[1]
+agent_name    = sys.argv[1]
 topic_devname = sys.argv[2]
-topic_label  = sys.argv[3]
-topic_desc   = sys.argv[4]
-topic_scope  = sys.argv[5]
-num_tests    = int(sys.argv[6])
-output_path  = sys.argv[7]
-suite_name   = sys.argv[8]
-extra_file   = sys.argv[9]
+topic_label   = sys.argv[3]
+topic_desc    = sys.argv[4]
+topic_scope   = sys.argv[5]
+num_tests     = int(sys.argv[6])
+output_path   = sys.argv[7]
+suite_name    = sys.argv[8]
+extra_file    = sys.argv[9]
+vars_file     = sys.argv[10] if len(sys.argv) > 10 else None
+
+# Load topic-level context variables
+topic_vars = []
+if vars_file:
+    try:
+        with open(vars_file, 'r', encoding='utf-8') as _vf:
+            topic_vars = json.load(_vf) or []
+    except Exception:
+        topic_vars = []
 
 # Read extra details from temp file
 with open(extra_file, 'r', encoding='utf-8') as f:
@@ -1908,6 +1976,16 @@ for i, (category, utterance) in enumerate(test_cases, 1):
     lines.append(f'        </expectation>')
     lines.append(f'        <inputs>')
     lines.append(f'            <utterance>{html.escape(utterance)}</utterance>')
+    for var in topic_vars:
+        vname  = html.escape(str(var.get("name",  "")))
+        vtype  = html.escape(str(var.get("type",  "Text")))
+        vvalue = html.escape(str(var.get("value", "")))
+        if vname:
+            lines.append(f'            <contextVariables>')
+            lines.append(f'                <name>{vname}</name>')
+            lines.append(f'                <type>{vtype}</type>')
+            lines.append(f'                <value>{vvalue}</value>')
+            lines.append(f'            </contextVariables>')
     lines.append(f'        </inputs>')
     lines.append(f'        <number>{i}</number>')
     lines.append(f'    </testCase>')
