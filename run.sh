@@ -1122,10 +1122,10 @@ fi  # end interactive topic selection + extra details
 # STEP 9: Ask about test generation
 # ============================================================================
 GENERATE_TESTS=false
-GEN_ENGINE="template"    # "template" or "llm"
-GEN_LLM_PROVIDER="claude" # Provider for LLM generation: claude, openai, gemini, ollama
-GEN_LLM_API_KEY=""        # API key for test generation LLM
-GEN_LLM_MODEL=""          # Model for test generation LLM
+GEN_ENGINE="template"                      # "template" or "llm"
+GEN_LLM_PROVIDER="${GEN_LLM_PROVIDER:-claude}" # preserve if restored by --run lastrun
+GEN_LLM_API_KEY="${GEN_LLM_API_KEY:-}"        # preserve if restored by --run lastrun
+GEN_LLM_MODEL="${GEN_LLM_MODEL:-}"            # preserve if restored by --run lastrun
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"  # preserve env var if already set
 
 if [ "$DIRECT_MODE" = true ]; then
