@@ -2964,7 +2964,8 @@ for spec_path in spec_files:
         lat_sess  = agent_result.get("latency_session_ms", 0)
         lat_msg   = agent_result.get("latency_message_ms", 0)
         lat_color = GREEN if lat_total < 3000 else YELLOW if lat_total < 8000 else RED
-        lat_str   = f" {DIM}[{lat_color}{lat_total}ms{NC}{DIM} · session:{lat_sess}ms msg:{lat_msg}ms]{NC}"
+        fmt = lambda ms: f"{ms/1000:.2f}s"
+        lat_str   = f" {DIM}[{lat_color}{fmt(lat_total)}{NC}{DIM} · session:{fmt(lat_sess)} msg:{fmt(lat_msg)}]{NC}"
 
         if agent_result["error"]:
             print(f"  {RED}ERROR{NC}{lat_str}")
