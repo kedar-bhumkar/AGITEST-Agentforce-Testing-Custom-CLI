@@ -84,12 +84,16 @@ export GEMINI_API_KEY="AI..."
 To use Agent API mode, you need a Salesforce External Client App with OAuth Client Credentials Flow:
 
 1. **Setup → External Client Apps Manager → New External Client App**
-2. Enable OAuth with scopes: `api`, `chatbot_api`, `sfap_api`, `refresh_token`
-3. Enable **Client Credentials Flow**
-4. Enable **Issue JWT-based access tokens for named users**
-5. Set a **Run As** user with appropriate permissions
-6. Set **Permitted Users** to *All users may self-authorize*
-7. Copy Consumer Key & Secret into `.env`
+2. Enable OAuth, set the callback URL to:
+   ```
+   https://login.salesforce.com/services/oauth2/callback
+   ```
+3. Add OAuth scopes: `api`, `chatbot_api`, `sfap_api`, `refresh_token`
+4. Enable **Client Credentials Flow**
+5. Enable **Issue JWT-based access tokens for named users**
+6. Set a **Run As** user with appropriate permissions
+7. Set **Permitted Users** to *All users may self-authorize*
+8. Copy Consumer Key & Secret into `.env`
 
 ## Context Variables in Spec Files
 
