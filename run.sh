@@ -543,16 +543,42 @@ if [ "$DIRECT_MODE" = false ]; then
         fi
 
         if [ -z "$AGENT_API_CONSUMER_KEY" ]; then
-            read -p "  Enter Consumer Key: " AGENT_API_CONSUMER_KEY
-            if [ -z "$AGENT_API_CONSUMER_KEY" ]; then
+            # Try last run as hint
+            _saved_key=""
+            if [ -f "$LAST_RUN_FILE" ]; then
+                _saved_key=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_KEY',''))" "$LAST_RUN_FILE" 2>/dev/null)
+            fi
+            _hint=""
+            [ -n "$_saved_key" ] && _hint=" ${DIM}[saved: ${_saved_key:0:8}… — press ENTER to reuse]${NC}"
+            echo -e "  Enter Consumer Key:${_hint}"
+            read -p "  > " _key_input
+            if [ -z "$_key_input" ] && [ -n "$_saved_key" ]; then
+                AGENT_API_CONSUMER_KEY="$_saved_key"
+                info "Using saved Consumer Key."
+            elif [ -n "$_key_input" ]; then
+                AGENT_API_CONSUMER_KEY="$_key_input"
+            else
                 die "Consumer Key is required for Agent API."
             fi
         fi
 
         if [ -z "$AGENT_API_CONSUMER_SECRET" ]; then
-            read -sp "  Enter Consumer Secret: " AGENT_API_CONSUMER_SECRET
+            # Try last run as hint
+            _saved_secret=""
+            if [ -f "$LAST_RUN_FILE" ]; then
+                _saved_secret=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_SECRET',''))" "$LAST_RUN_FILE" 2>/dev/null)
+            fi
+            _hint=""
+            [ -n "$_saved_secret" ] && _hint=" ${DIM}[saved — press ENTER to reuse]${NC}"
+            echo -e "  Enter Consumer Secret:${_hint}"
+            read -sp "  > " _secret_input
             echo ""
-            if [ -z "$AGENT_API_CONSUMER_SECRET" ]; then
+            if [ -z "$_secret_input" ] && [ -n "$_saved_secret" ]; then
+                AGENT_API_CONSUMER_SECRET="$_saved_secret"
+                info "Using saved Consumer Secret."
+            elif [ -n "$_secret_input" ]; then
+                AGENT_API_CONSUMER_SECRET="$_secret_input"
+            else
                 die "Consumer Secret is required for Agent API."
             fi
         fi
@@ -716,9 +742,9 @@ if [ "$DIRECT_MODE" = false ]; then
 
     BOTS_JSON_FILE=$(mktemp)
     run_sf data query \
-        --query "SELECT Id, DeveloperName, MasterLabel FROM BotDefinition WHERE Status = 'Active' ORDER BY MasterLabel ASC" \
+        --query "SELECT Id, DeveloperName, MasterLabel, Status, LastModifiedDate FROM BotDefinition WHERE Status IN ('Active','Draft','Committed') ORDER BY LastModifiedDate DESC" \
         --target-org "$ORG" --json > "$BOTS_JSON_FILE" 2>/dev/null &
-    spinner $! "Listing active agents in org..."
+    spinner $! "Listing agents in org..."
 
     BOTS_JSON=$(cat "$BOTS_JSON_FILE")
     rm -f "$BOTS_JSON_FILE"
@@ -730,30 +756,45 @@ try:
     records = d.get('result', {}).get('records', [])
     if not records:
         sys.exit(0)
+    # Deduplicate by DeveloperName — keep the most recently modified version
+    seen = {}
     for rec in records:
-        fn = rec.get('DeveloperName', '')
-        fid = rec.get('Id', '')
-        if fn:
-            print(f'{fn}|{fid}')
+        fn     = rec.get('DeveloperName', '')
+        fid    = rec.get('Id', '')
+        status = rec.get('Status', '')
+        lmd    = rec.get('LastModifiedDate', '')
+        if fn and fn not in seen:
+            seen[fn] = (fid, status, lmd)
+    for fn, (fid, status, lmd) in seen.items():
+        print(f'{fn}|{fid}|{status}')
 except Exception as e:
     print(f'ERROR|{e}', file=sys.stderr)
 " 2>/dev/null)
 
     if [ -z "$BOTS_PARSED" ]; then
-        die "No active agents found in this org. Make sure you have at least one active Agentforce agent."
+        die "No agents found in this org. Make sure you have at least one Agentforce agent (Active, Draft, or Committed)."
     fi
 
     AGENT_NAMES=()
     AGENT_IDS=()
-    while IFS='|' read -r name fid; do
+    AGENT_STATUSES=()
+    while IFS='|' read -r name fid status; do
         AGENT_NAMES+=("$name")
         AGENT_IDS+=("$fid")
+        AGENT_STATUSES+=("$status")
     done <<< "$BOTS_PARSED"
 
     echo ""
-    echo -e "  ${BOLD}Available Agents:${NC}"
+    echo -e "  ${BOLD}Available Agents:${NC} ${DIM}(ordered by last modified — most recent first)${NC}"
     for i in "${!AGENT_NAMES[@]}"; do
-        printf "    ${BOLD}%d)${NC} %s\n" "$((i+1))" "${AGENT_NAMES[$i]}"
+        status="${AGENT_STATUSES[$i]}"
+        case "$status" in
+            Active)    status_tag="${GREEN}Active${NC}" ;;
+            Draft)     status_tag="${YELLOW}Draft${NC}" ;;
+            Committed) status_tag="${CYAN}Committed${NC}" ;;
+            *)         status_tag="${DIM}${status}${NC}" ;;
+        esac
+        printf "    ${BOLD}%d)${NC} %-40s ${DIM}[${NC}${status_tag}${DIM}]${NC}\n" "$((i+1))" "${AGENT_NAMES[$i]}"
     done
 
     # ── Step 6: Select ───────────────────────────────────────────────────
@@ -2706,8 +2747,10 @@ def run_agent_test(utterance, variables=None, retry_count=3):
     variables = variables or []
 
     # Split: context vars go in session only; custom vars go in both
-    session_vars = variables  # pass all at session creation
+    session_vars = variables
     msg_vars     = [v for v in variables if not v["name"].startswith("$Context.")]
+
+    t_total_start = time.time()
 
     # 1. Create session
     session_body = {
@@ -2720,7 +2763,9 @@ def run_agent_test(utterance, variables=None, retry_count=3):
         session_body["variables"] = session_vars
 
     session_url = f"https://api.salesforce.com/einstein/ai-agent/v1/agents/{agent_bot_id}/sessions"
+    t0 = time.time()
     session_resp = api_call("POST", session_url, session_body, agent_headers())
+    latency_session = round((time.time() - t0) * 1000)
 
     if "error" in session_resp:
         code = session_resp.get("httpStatusCode", 0)
@@ -2730,11 +2775,13 @@ def run_agent_test(utterance, variables=None, retry_count=3):
         err_detail = session_resp.get("error", "Unknown error")
         if isinstance(err_detail, dict):
             err_detail = err_detail.get("message", json.dumps(err_detail)[:200])
-        return {"error": f"Session creation failed ({code}): {err_detail}", "response": ""}
+        return {"error": f"Session creation failed ({code}): {err_detail}", "response": "",
+                "latency_ms": latency_session, "latency_session_ms": latency_session, "latency_message_ms": 0}
 
     session_id = session_resp.get("sessionId", "")
     if not session_id:
-        return {"error": f"No sessionId in response: {json.dumps(session_resp)[:200]}", "response": ""}
+        return {"error": f"No sessionId in response: {json.dumps(session_resp)[:200]}", "response": "",
+                "latency_ms": latency_session, "latency_session_ms": latency_session, "latency_message_ms": 0}
 
     # 2. Send utterance (include editable vars so they can be mutated per-turn)
     msg_body = {
@@ -2748,7 +2795,9 @@ def run_agent_test(utterance, variables=None, retry_count=3):
         msg_body["variables"] = msg_vars
 
     msg_url = f"https://api.salesforce.com/einstein/ai-agent/v1/sessions/{session_id}/messages"
+    t0 = time.time()
     msg_resp = api_call("POST", msg_url, msg_body, agent_headers())
+    latency_message = round((time.time() - t0) * 1000)
 
     # Extract response text
     response_text = ""
@@ -2774,7 +2823,13 @@ def run_agent_test(utterance, variables=None, retry_count=3):
     end_headers = {**agent_headers(), "x-session-end-reason": "UserRequest"}
     api_call("DELETE", end_url, None, end_headers)
 
-    return {"error": "", "response": response_text}
+    latency_total = round((time.time() - t_total_start) * 1000)
+    return {
+        "error": "", "response": response_text,
+        "latency_ms": latency_total,
+        "latency_session_ms": latency_session,
+        "latency_message_ms": latency_message,
+    }
 
 # ── Helper: LLM evaluation ────────────────────────────────────────────────
 def evaluate_with_llm(expected, actual):
@@ -2905,8 +2960,14 @@ for spec_path in spec_files:
         # Send to Agent API (with any spec-defined context/custom variables)
         agent_result = run_agent_test(utterance, variables=variables)
 
+        lat_total = agent_result.get("latency_ms", 0)
+        lat_sess  = agent_result.get("latency_session_ms", 0)
+        lat_msg   = agent_result.get("latency_message_ms", 0)
+        lat_color = GREEN if lat_total < 3000 else YELLOW if lat_total < 8000 else RED
+        lat_str   = f" {DIM}[{lat_color}{lat_total}ms{NC}{DIM} · session:{lat_sess}ms msg:{lat_msg}ms]{NC}"
+
         if agent_result["error"]:
-            print(f"  {RED}ERROR{NC}")
+            print(f"  {RED}ERROR{NC}{lat_str}")
             print(f"      {RED}{agent_result['error'][:100]}{NC}")
             result_cases.append({
                 "testNumber": num,
@@ -2928,7 +2989,7 @@ for spec_path in spec_files:
             continue
 
         actual = agent_result["response"]
-        print(f"  {GREEN}OK{NC}", flush=True)
+        print(f"  {GREEN}OK{NC}{lat_str}", flush=True)
 
         # Evaluate with LLM
         print(f"      {DIM}Evaluating with {llm_provider}...{NC}", end="", flush=True)
