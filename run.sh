@@ -81,7 +81,7 @@ while [[ $# -gt 0 ]]; do
                 echo ""
                 echo -e "\033[1m\033[0;36m  ↺  Replaying last run settings from .last_run.json\033[0m"
                 # Load each field (python prints KEY=VALUE lines we eval)
-                eval "$(python3 - "$LAST_RUN_FILE" << 'PYLASTRUN'
+                eval "$(python3 - "$LAST_RUN_FILE" << 'PYLASTRUN' | tr -d '\r'
 import json, sys, os
 with open(sys.argv[1], 'r') as f:
     s = json.load(f)
@@ -91,7 +91,7 @@ for k, v in s.items():
         safe = str(v).replace("'", "'\\''")
         print(f"export {k}='{safe}'")
 PYLASTRUN
-| tr -d '\r')"
+)"
                 # Map saved keys back to script variables
                 [ -n "${LR_ORG:-}"              ] && ORG="$LR_ORG"
                 [ -n "${LR_AGENT_NAME:-}"       ] && DIRECT_BOT="$LR_AGENT_NAME"
@@ -800,21 +800,65 @@ except Exception as e:
         read -p "  Select an agent (number): " agent_choice
         if [[ "$agent_choice" =~ ^[0-9]+$ ]] && [ "$agent_choice" -ge 1 ] && [ "$agent_choice" -le "${#AGENT_NAMES[@]}" ]; then
             AGENT_NAME="${AGENT_NAMES[$((agent_choice-1))]}"
+            SELECTED_BOT_DEF_ID="${AGENT_IDS[$((agent_choice-1))]}"
             break
         else
             echo -e "  ${RED}Invalid selection. Enter a number between 1 and ${#AGENT_NAMES[@]}.${NC}"
         fi
     done
 
-    ok "Selected agent: $AGENT_NAME"
+    ok "Selected agent: ${AGENT_LABELS[$((agent_choice-1))]} ($AGENT_NAME)"
+
+    # ── Show version info for selected agent ────────────────────────────────
+    _bv_json_file=$(mktemp)
+    run_sf data query \
+        --query "SELECT Id, VersionNumber, Status FROM BotVersion WHERE BotDefinitionId = '${SELECTED_BOT_DEF_ID}' ORDER BY VersionNumber DESC LIMIT 1" \
+        --target-org "$ORG" --json > "$_bv_json_file" 2>/dev/null &
+    wait $!
+    _bv_json=$(cat "$_bv_json_file"); rm -f "$_bv_json_file"
+
+    _bv_info=$(echo "$_bv_json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    recs = d.get('result', {}).get('records', [])
+    if recs:
+        r = recs[0]
+        print(str(r.get('VersionNumber','?')) + '|' + str(r.get('Status','Unknown')) + '|' + str(r.get('Id','')))
+    else:
+        print('none||')
+except:
+    print('none||')
+" 2>/dev/null)
+
+    IFS='|' read -r _bv_num _bv_status _bv_id <<< "$_bv_info"
+    if [ "$_bv_num" = "none" ]; then
+        warn "No versions found for this agent."
+    else
+        if [ "$_bv_status" = "Active" ]; then
+            info "Version: v${_bv_num}  ${GREEN}[Active]${NC}"
+        else
+            info "Version: v${_bv_num}  ${YELLOW}[${_bv_status}]${NC}"
+            if [ "$TEST_METHOD" = "agent_api" ]; then
+                warn "Agent is not Active — the Agent API requires an active/published version."
+                warn "Activate this agent in Agentforce Builder before running Agent API tests."
+            fi
+        fi
+    fi
 else
     # Direct mode: agent already set from --run arg
+    SELECTED_BOT_DEF_ID=""
     info "Agent: $AGENT_NAME"
 fi
 
 # ── Resolve Agent Bot ID for Agent API path ─────────────────────────────────
 if [ "$TEST_METHOD" = "agent_api" ]; then
-    info "Resolving Agent Bot ID for Agent API..."
+    # In interactive mode we already have the BotDefinition ID from discovery
+    if [ -n "${SELECTED_BOT_DEF_ID:-}" ]; then
+        AGENT_BOT_ID="$SELECTED_BOT_DEF_ID"
+        ok "Agent Bot ID: $AGENT_BOT_ID"
+    else
+        info "Resolving Agent Bot ID for Agent API..."
 
     # Need access token early — get org details
     _BOT_ORG_JSON=$(run_sf org display --target-org "$ORG" --json 2>/dev/null) || true
@@ -866,6 +910,7 @@ PYBOTID
     fi
 
     ok "Agent Bot ID: $AGENT_BOT_ID"
+    fi  # end: else (direct mode AGENT_BOT_ID resolution)
 fi
 
 # ============================================================================
@@ -2771,7 +2816,13 @@ def run_agent_test(utterance, variables=None, retry_count=3):
         err_detail = session_resp.get("error", "Unknown error")
         if isinstance(err_detail, dict):
             err_detail = err_detail.get("message", json.dumps(err_detail)[:200])
-        return {"error": f"Session creation failed ({code}): {err_detail}", "response": "",
+        err_str = str(err_detail)
+        if "valid version" in err_str.lower() or "no valid" in err_str.lower():
+            err_str = (f"No valid version available ({code}): The agent has no active/published version. "
+                       "Open Agentforce Builder, activate the agent, then retry.")
+        else:
+            err_str = f"Session creation failed ({code}): {err_detail}"
+        return {"error": err_str, "response": "",
                 "latency_ms": latency_session, "latency_session_ms": latency_session, "latency_message_ms": 0}
 
     session_id = session_resp.get("sessionId", "")
