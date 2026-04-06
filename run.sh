@@ -753,30 +753,45 @@ if [ "$DIRECT_MODE" = false ]; then
     BOTS_JSON=$(cat "$BOTS_JSON_FILE")
     rm -f "$BOTS_JSON_FILE"
 
-    BOTS_PARSED=$(echo "$BOTS_JSON" | python3 -c "
+    _parse_bots() {
+        echo "$1" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
     records = d.get('result', {}).get('records', [])
     if not records:
         sys.exit(0)
-    # Deduplicate by DeveloperName — keep the most recently modified version
     seen = {}
     for rec in records:
         fn     = rec.get('DeveloperName', '')
         fid    = rec.get('Id', '')
         status = rec.get('Status', '')
-        lmd    = rec.get('LastModifiedDate', '')
         if fn and fn not in seen:
-            seen[fn] = (fid, status, lmd)
-    for fn, (fid, status, lmd) in seen.items():
+            seen[fn] = (fid, status)
+    for fn, (fid, status) in seen.items():
         print(f'{fn}|{fid}|{status}')
 except Exception as e:
     print(f'ERROR|{e}', file=sys.stderr)
-" 2>/dev/null)
+" 2>/dev/null
+    }
+
+    BOTS_PARSED=$(_parse_bots "$BOTS_JSON")
+
+    # Fallback: if status-filtered query returned nothing, try all bots
+    if [ -z "$BOTS_PARSED" ]; then
+        info "No Active/Draft agents found — querying all agents in org..."
+        BOTS_JSON_FILE2=$(mktemp)
+        run_sf data query \
+            --query "SELECT Id, DeveloperName, MasterLabel, Status, LastModifiedDate FROM BotDefinition ORDER BY LastModifiedDate DESC" \
+            --target-org "$ORG" --json > "$BOTS_JSON_FILE2" 2>/dev/null &
+        spinner $! "Listing all agents..."
+        BOTS_JSON=$( cat "$BOTS_JSON_FILE2")
+        rm -f "$BOTS_JSON_FILE2"
+        BOTS_PARSED=$(_parse_bots "$BOTS_JSON")
+    fi
 
     if [ -z "$BOTS_PARSED" ]; then
-        die "No agents found in this org. Make sure you have at least one Agentforce agent (Active or Draft status)."
+        die "No agents found in this org. Make sure you have at least one Agentforce agent deployed."
     fi
 
     AGENT_NAMES=()
