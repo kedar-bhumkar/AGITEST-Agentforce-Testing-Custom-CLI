@@ -812,7 +812,7 @@ except Exception as e:
     # ── Show version info for selected agent ────────────────────────────────
     _bv_json_file=$(mktemp)
     run_sf data query \
-        --query "SELECT Id, VersionNumber, Status FROM BotVersion WHERE BotDefinitionId = '${SELECTED_BOT_DEF_ID}' ORDER BY VersionNumber DESC LIMIT 1" \
+        --query "SELECT Id, VersionNumber, Status FROM BotVersion WHERE BotDefinitionId = '${SELECTED_BOT_DEF_ID}' AND Status = 'Active' LIMIT 1" \
         --target-org "$ORG" --json > "$_bv_json_file" 2>/dev/null &
     wait $!
     _bv_json=$(cat "$_bv_json_file"); rm -f "$_bv_json_file"
@@ -836,7 +836,7 @@ except:
         warn "No versions found for this agent."
     else
         if [ "$_bv_status" = "Active" ]; then
-            info "Version: v${_bv_num}  ${GREEN}[Active]${NC}"
+            info "Version: v${_bv_num}  ${GREEN}[Active]${NC}  ${DIM}(API version — Builder UI may show a different number)${NC}"
         else
             info "Version: v${_bv_num}  ${YELLOW}[${_bv_status}]${NC}"
             if [ "$TEST_METHOD" = "agent_api" ]; then
@@ -848,6 +848,7 @@ except:
 else
     # Direct mode: agent already set from --run arg
     SELECTED_BOT_DEF_ID=""
+    _bv_id=""
     info "Agent: $AGENT_NAME"
 fi
 
@@ -952,12 +953,13 @@ if [ -n "$ACCESS_TOKEN" ] && [ -n "$INSTANCE_URL_API" ]; then
     #   2. GenAiPlannerFunctionDef: get Plugin IDs for those planners
     #   3. GenAiPluginDefinition: get plugin names, labels, descriptions
 
-    TOPICS_PARSED=$(python3 - "$ACCESS_TOKEN" "$INSTANCE_URL_API" "$AGENT_NAME" << 'PYTOPICS'
+    TOPICS_PARSED=$(python3 - "$ACCESS_TOKEN" "$INSTANCE_URL_API" "$AGENT_NAME" "${_bv_id:-}" << 'PYTOPICS'
 import sys, json, urllib.request, urllib.parse
 
 token = sys.argv[1]
 base = sys.argv[2]
 agent = sys.argv[3]
+active_bv_id = sys.argv[4] if len(sys.argv) > 4 else ""
 
 def soql(query):
     url = f"{base}/services/data/v66.0/query/?q={urllib.parse.quote(query)}"
@@ -968,9 +970,29 @@ def soql(query):
     except Exception as e:
         return {"records": [], "error": str(e)}
 
-# Step 1: Find planner IDs for this agent (planners are named <AgentName>_v1, _v2, etc.)
-planners = soql(f"SELECT Id, DeveloperName FROM GenAiPlannerDefinition WHERE DeveloperName LIKE '{agent}_v%'")
-planner_ids = [r["Id"] for r in planners.get("records", [])]
+# Step 1: Find the planner for the ACTIVE BotVersion.
+# Primary: query GenAiPlannerDefinition directly by BotVersionId (most precise).
+# Fallback 1: sort all versioned planners numerically, take latest.
+# Fallback 2: exact name match (no version suffix).
+planner_ids = []
+
+if active_bv_id:
+    result = soql(f"SELECT Id, DeveloperName FROM GenAiPlannerDefinition WHERE BotVersionId = '{active_bv_id}'")
+    planner_ids = [r["Id"] for r in result.get("records", [])]
+
+if not planner_ids:
+    planners = soql(f"SELECT Id, DeveloperName FROM GenAiPlannerDefinition WHERE DeveloperName LIKE '{agent}_v%'")
+    planner_recs = planners.get("records", [])
+
+    def _planner_ver(rec):
+        dn = rec.get("DeveloperName", "")
+        try:
+            return int(dn.rsplit("_v", 1)[-1])
+        except Exception:
+            return 0
+
+    planner_recs.sort(key=_planner_ver, reverse=True)
+    planner_ids = [planner_recs[0]["Id"]] if planner_recs else []
 
 if not planner_ids:
     # Fallback: try exact match (some agents don't have version suffix)
@@ -1114,8 +1136,8 @@ else
     echo ""
 fi
 
-declare -A TOPIC_EXTRA_DETAILS
-declare -A TOPIC_CONTEXT_VARS   # JSON array of {name,type,value} per topic idx
+declare -a TOPIC_EXTRA_DETAILS
+declare -a TOPIC_CONTEXT_VARS   # JSON array of {name,type,value} per topic idx
 
 if [ "$DIRECT_MODE" = false ]; then
     # ── Interactive topic selection ──────────────────────────────────────
@@ -1305,7 +1327,7 @@ case "$gen_choice" in
                     1) GEN_LLM_PROVIDER="openai";  GEN_LLM_MODEL="gpt-4o"; break ;;
                     2) GEN_LLM_PROVIDER="claude";  GEN_LLM_MODEL="claude-sonnet-4-20250514"; break ;;
                     3) GEN_LLM_PROVIDER="gemini";  GEN_LLM_MODEL="gemini-2.0-flash"; break ;;
-                    4) GEN_LLM_PROVIDER="ollama";  GEN_LLM_MODEL="llama3"; break ;;
+                    4) GEN_LLM_PROVIDER="ollama";  GEN_LLM_MODEL="gemma4:e4b"; break ;;
                     *) echo -e "  ${RED}Enter 1, 2, 3, or 4.${NC}" ;;
                 esac
             done
@@ -1355,7 +1377,7 @@ case "$gen_choice" in
                 ollama)
                     GEN_LLM_API_KEY="ollama"
                     echo ""
-                    read -p "  Enter Ollama model name [default: llama3]: " ollama_gen_model
+                    read -p "  Enter Ollama model name [default: gemma4:e4b]: " ollama_gen_model
                     [ -n "$ollama_gen_model" ] && GEN_LLM_MODEL="$ollama_gen_model"
                     read -p "  Enter Ollama URL [default: http://localhost:11434]: " ollama_gen_url
                     [ -n "$ollama_gen_url" ] && OLLAMA_URL="$ollama_gen_url"
@@ -2294,11 +2316,11 @@ except Exception as e:
                     fi
 
                     if [ -z "$LLM_MODEL" ]; then
-                        read -p "  Enter Ollama model name [default: llama3]: " ollama_model
+                        read -p "  Enter Ollama model name [default: gemma4:e4b]: " ollama_model
                         if [ -n "$ollama_model" ]; then
                             LLM_MODEL="$ollama_model"
                         else
-                            LLM_MODEL="llama3"
+                            LLM_MODEL="gemma4:e4b"
                         fi
                     fi
                     ok "Using Ollama model: $LLM_MODEL"
@@ -2820,6 +2842,17 @@ def run_agent_test(utterance, variables=None, retry_count=3):
         if "valid version" in err_str.lower() or "no valid" in err_str.lower():
             err_str = (f"No valid version available ({code}): The agent has no active/published version. "
                        "Open Agentforce Builder, activate the agent, then retry.")
+        elif "InternalVariableMutationAttemptException" in err_str and session_vars and retry_count > 0:
+            # One or more variables in the spec are marked as "internal" in the agent's BotVariable
+            # definition. Internal variables are read-only via the external Agent API — they can only
+            # be set through the Testing Center (which has platform-level access). Retry without
+            # variables so the test can still run; results will reflect the agent's default state.
+            var_names = ", ".join(v["name"] for v in session_vars)
+            import sys
+            print(f"  [WARN] Session rejected internal variable(s): {var_names}. "
+                  "These are marked internal in the agent and cannot be set via the Agent API "
+                  "(only via Testing Center). Retrying without variables.", file=sys.stderr)
+            return run_agent_test(utterance, [], retry_count - 1)
         else:
             err_str = f"Session creation failed ({code}): {err_detail}"
         return {"error": err_str, "response": "",
