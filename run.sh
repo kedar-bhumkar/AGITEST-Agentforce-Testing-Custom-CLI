@@ -1630,6 +1630,52 @@ except Exception as e:
     fi
 fi  # end interactive steps 9-10
 
+# ── Save run settings for --run lastrun ──────────────────────────────────────
+# Saved HERE (before testing begins) so settings are preserved even if
+# testing fails (deploy error, API error, etc.) — not just on success.
+_lr_benchmark_names=$(IFS='|'; echo "${BENCHMARK_AGENT_NAMES[*]}")
+_lr_benchmark_ids=$(IFS='|'; echo "${BENCHMARK_AGENT_IDS[*]}")
+_lr_benchmark_labels=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
+python3 - "$LAST_RUN_FILE" \
+    "$AGENT_NAME" \
+    "${ORG:-}" \
+    "${TEST_METHOD:-testing_center}" \
+    "${NUM_TESTS:-10}" \
+    "${LLM_PROVIDER:-}" \
+    "${LLM_MODEL:-}" \
+    "${LLM_API_KEY:-}" \
+    "${AGENT_API_CONSUMER_KEY:-}" \
+    "${AGENT_API_CONSUMER_SECRET:-}" \
+    "${AGENT_SESSION_MODE:-per_test}" \
+    "${AGENT_PARALLEL_MODE:-false}" \
+    "${AGENT_MAX_WORKERS:-3}" \
+    "${GEN_ENGINE:-template}" \
+    "${GEN_LLM_PROVIDER:-claude}" \
+    "${GEN_LLM_MODEL:-}" \
+    "${GEN_LLM_API_KEY:-}" \
+    "${TEST_TYPE:-qa}" \
+    "${_lr_benchmark_names:-}" \
+    "${_lr_benchmark_ids:-}" \
+    "${_lr_benchmark_labels:-}" \
+    "${BENCHMARK_EXECUTION:-serial}" << 'PYSAVELASTRUN'
+import json, sys
+last_run_file   = sys.argv[1]
+keys = [
+    "LR_AGENT_NAME", "LR_ORG", "LR_TEST_METHOD", "LR_NUM_TESTS",
+    "LR_LLM_PROVIDER", "LR_LLM_MODEL", "LR_LLM_API_KEY",
+    "LR_CONSUMER_KEY", "LR_CONSUMER_SECRET", "LR_SESSION_MODE",
+    "LR_PARALLEL_MODE", "LR_MAX_WORKERS",
+    "LR_GEN_ENGINE", "LR_GEN_LLM_PROVIDER", "LR_GEN_LLM_MODEL", "LR_GEN_LLM_API_KEY",
+    "LR_TEST_TYPE",
+    "LR_BENCHMARK_NAMES", "LR_BENCHMARK_IDS", "LR_BENCHMARK_LABELS",
+    "LR_BENCHMARK_EXECUTION",
+]
+state = {k: v for k, v in zip(keys, sys.argv[2:])}
+with open(last_run_file, 'w') as f:
+    json.dump(state, f, indent=2)
+print(f"  Settings saved to .last_run.json (use --run lastrun to repeat)")
+PYSAVELASTRUN
+
 # ============================================================================
 # STEP 11: Generate AiEvaluationDefinition XML files
 # ============================================================================
@@ -3896,50 +3942,6 @@ print(f"{BOLD}{CYAN}{'='*72}{NC}")
 PYSCORE
 
 fi  # end: if not benchmark
-
-# ── Save run settings for --run lastrun ──────────────────────────────────────
-_lr_benchmark_names=$(IFS='|'; echo "${BENCHMARK_AGENT_NAMES[*]}")
-_lr_benchmark_ids=$(IFS='|'; echo "${BENCHMARK_AGENT_IDS[*]}")
-_lr_benchmark_labels=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
-python3 - "$LAST_RUN_FILE" \
-    "$AGENT_NAME" \
-    "${ORG:-}" \
-    "${TEST_METHOD:-testing_center}" \
-    "${NUM_TESTS:-10}" \
-    "${LLM_PROVIDER:-}" \
-    "${LLM_MODEL:-}" \
-    "${LLM_API_KEY:-}" \
-    "${AGENT_API_CONSUMER_KEY:-}" \
-    "${AGENT_API_CONSUMER_SECRET:-}" \
-    "${AGENT_SESSION_MODE:-per_test}" \
-    "${AGENT_PARALLEL_MODE:-false}" \
-    "${AGENT_MAX_WORKERS:-3}" \
-    "${GEN_ENGINE:-template}" \
-    "${GEN_LLM_PROVIDER:-claude}" \
-    "${GEN_LLM_MODEL:-}" \
-    "${GEN_LLM_API_KEY:-}" \
-    "${TEST_TYPE:-qa}" \
-    "${_lr_benchmark_names:-}" \
-    "${_lr_benchmark_ids:-}" \
-    "${_lr_benchmark_labels:-}" \
-    "${BENCHMARK_EXECUTION:-serial}" << 'PYSAVELASTRUN'
-import json, sys
-last_run_file   = sys.argv[1]
-keys = [
-    "LR_AGENT_NAME", "LR_ORG", "LR_TEST_METHOD", "LR_NUM_TESTS",
-    "LR_LLM_PROVIDER", "LR_LLM_MODEL", "LR_LLM_API_KEY",
-    "LR_CONSUMER_KEY", "LR_CONSUMER_SECRET", "LR_SESSION_MODE",
-    "LR_PARALLEL_MODE", "LR_MAX_WORKERS",
-    "LR_GEN_ENGINE", "LR_GEN_LLM_PROVIDER", "LR_GEN_LLM_MODEL", "LR_GEN_LLM_API_KEY",
-    "LR_TEST_TYPE",
-    "LR_BENCHMARK_NAMES", "LR_BENCHMARK_IDS", "LR_BENCHMARK_LABELS",
-    "LR_BENCHMARK_EXECUTION",
-]
-state = {k: v for k, v in zip(keys, sys.argv[2:])}
-with open(last_run_file, 'w') as f:
-    json.dump(state, f, indent=2)
-print(f"  Settings saved to .last_run.json (use --run lastrun to repeat)")
-PYSAVELASTRUN
 
 echo ""
 echo -e "${BOLD}${GREEN}Done.${NC} Results are in: ${BOLD}$RESULTS_DIR${NC}"
