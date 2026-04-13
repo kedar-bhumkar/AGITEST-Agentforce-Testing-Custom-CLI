@@ -559,59 +559,50 @@ if [ "$DIRECT_MODE" = false ]; then
         echo -e "  ${DIM}  6. Copy Consumer Key & Secret from OAuth Settings${NC}"
         echo ""
 
-        # Check env vars first
-        if [ -z "$AGENT_API_CONSUMER_KEY" ] && [ -n "${SF_AGENT_API_CONSUMER_KEY:-}" ]; then
-            AGENT_API_CONSUMER_KEY="$SF_AGENT_API_CONSUMER_KEY"
-            info "Using SF_AGENT_API_CONSUMER_KEY from environment."
+        # Always prompt in interactive mode so user can correct bad credentials.
+        # Merge priority for default: lastrun JSON > env var > empty.
+        # ── Consumer Key ────────────────────────────────────────────────────
+        _saved_key=""
+        if [ -f "$LAST_RUN_FILE" ]; then
+            _saved_key=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_KEY',''), end='')" "$LAST_RUN_FILE" 2>/dev/null | tr -d '\r')
         fi
-        if [ -z "$AGENT_API_CONSUMER_SECRET" ] && [ -n "${SF_AGENT_API_CONSUMER_SECRET:-}" ]; then
-            AGENT_API_CONSUMER_SECRET="$SF_AGENT_API_CONSUMER_SECRET"
-            info "Using SF_AGENT_API_CONSUMER_SECRET from environment."
+        # Fall back to env/current value as the reusable default
+        [ -z "$_saved_key" ] && _saved_key="${AGENT_API_CONSUMER_KEY:-}"
+
+        _hint=""
+        [ -n "$_saved_key" ] && _hint=" ${DIM}[${_saved_key:0:8}… — press ENTER to reuse]${NC}"
+        echo -e "  Enter Consumer Key:${_hint}"
+        read -p "  > " _key_input
+        _key_input=$(echo "$_key_input" | tr -d '\r')
+        if [ -z "$_key_input" ] && [ -n "$_saved_key" ]; then
+            AGENT_API_CONSUMER_KEY="$_saved_key"
+            info "Using saved Consumer Key."
+        elif [ -n "$_key_input" ]; then
+            AGENT_API_CONSUMER_KEY="$_key_input"
+        else
+            die "Consumer Key is required for Agent API."
         fi
 
-        if [ -z "$AGENT_API_CONSUMER_KEY" ]; then
-            # Try last run as hint
-            _saved_key=""
-            if [ -f "$LAST_RUN_FILE" ]; then
-                # tr -d '\r' strips Windows CR that Python print() adds on Windows
-                _saved_key=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_KEY',''), end='')" "$LAST_RUN_FILE" 2>/dev/null | tr -d '\r')
-            fi
-            _hint=""
-            [ -n "$_saved_key" ] && _hint=" ${DIM}[saved: ${_saved_key:0:8}… — press ENTER to reuse]${NC}"
-            echo -e "  Enter Consumer Key:${_hint}"
-            read -p "  > " _key_input
-            _key_input=$(echo "$_key_input" | tr -d '\r')
-            if [ -z "$_key_input" ] && [ -n "$_saved_key" ]; then
-                AGENT_API_CONSUMER_KEY="$_saved_key"
-                info "Using saved Consumer Key."
-            elif [ -n "$_key_input" ]; then
-                AGENT_API_CONSUMER_KEY="$_key_input"
-            else
-                die "Consumer Key is required for Agent API."
-            fi
+        # ── Consumer Secret ──────────────────────────────────────────────────
+        _saved_secret=""
+        if [ -f "$LAST_RUN_FILE" ]; then
+            _saved_secret=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_SECRET',''), end='')" "$LAST_RUN_FILE" 2>/dev/null | tr -d '\r')
         fi
+        [ -z "$_saved_secret" ] && _saved_secret="${AGENT_API_CONSUMER_SECRET:-}"
 
-        if [ -z "$AGENT_API_CONSUMER_SECRET" ]; then
-            # Try last run as hint
-            _saved_secret=""
-            if [ -f "$LAST_RUN_FILE" ]; then
-                # tr -d '\r' strips Windows CR that Python print() adds on Windows
-                _saved_secret=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('LR_CONSUMER_SECRET',''), end='')" "$LAST_RUN_FILE" 2>/dev/null | tr -d '\r')
-            fi
-            _hint=""
-            [ -n "$_saved_secret" ] && _hint=" ${DIM}[saved — press ENTER to reuse]${NC}"
-            echo -e "  Enter Consumer Secret:${_hint}"
-            read -sp "  > " _secret_input
-            echo ""
-            _secret_input=$(echo "$_secret_input" | tr -d '\r')
-            if [ -z "$_secret_input" ] && [ -n "$_saved_secret" ]; then
-                AGENT_API_CONSUMER_SECRET="$_saved_secret"
-                info "Using saved Consumer Secret."
-            elif [ -n "$_secret_input" ]; then
-                AGENT_API_CONSUMER_SECRET="$_secret_input"
-            else
-                die "Consumer Secret is required for Agent API."
-            fi
+        _hint=""
+        [ -n "$_saved_secret" ] && _hint=" ${DIM}[saved — press ENTER to reuse]${NC}"
+        echo -e "  Enter Consumer Secret:${_hint}"
+        read -sp "  > " _secret_input
+        echo ""
+        _secret_input=$(echo "$_secret_input" | tr -d '\r')
+        if [ -z "$_secret_input" ] && [ -n "$_saved_secret" ]; then
+            AGENT_API_CONSUMER_SECRET="$_saved_secret"
+            info "Using saved Consumer Secret."
+        elif [ -n "$_secret_input" ]; then
+            AGENT_API_CONSUMER_SECRET="$_secret_input"
+        else
+            die "Consumer Secret is required for Agent API."
         fi
 
         # ── Obtain OAuth token via Client Credentials flow ──────────────────
