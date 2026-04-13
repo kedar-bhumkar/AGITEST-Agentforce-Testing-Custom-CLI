@@ -2678,27 +2678,31 @@ SFDXEOF
 cp "$SPECS_DIR"/*.aiEvaluationDefinition-meta.xml \
    "$DEPLOY_DIR/force-app/main/default/aiEvaluationDefinitions/"
 
-# Strip <contextVariables> blocks — Testing Center metadata API does not support
-# that element in AiEvaluationAgentTestCaseInput; Agent API reads them from
-# the source specs directly, so stripping only the deploy copies is safe.
-python3 - "$DEPLOY_DIR/force-app/main/default/aiEvaluationDefinitions" << 'PYSTRIP_CV'
+# Patch deploy copies:
+#  1. Strip <contextVariables> — Testing Center metadata API rejects this element;
+#     Agent API reads contextVariables from the source specs directly, so safe to strip.
+#  2. Replace <subjectName> with the actual agent being tested — spec files may have
+#     been written for a different agent (or the wrong name), causing "BotVersion not
+#     found" errors when Testing Center tries to locate the agent.
+python3 - "$DEPLOY_DIR/force-app/main/default/aiEvaluationDefinitions" "$AGENT_NAME" << 'PYSTRIP_CV'
 import sys, os, re
-deploy_dir = sys.argv[1]
-# Pattern matches a full <contextVariables>...</contextVariables> block (multiline)
-cv_pattern = re.compile(
-    r'\s*<contextVariables>.*?</contextVariables>',
-    re.DOTALL
-)
+deploy_dir  = sys.argv[1]
+agent_name  = sys.argv[2]
+
+cv_pattern  = re.compile(r'\s*<contextVariables>.*?</contextVariables>', re.DOTALL)
+subj_pattern = re.compile(r'<subjectName>[^<]*</subjectName>')
+
 for fname in os.listdir(deploy_dir):
     if not fname.endswith('.xml'):
         continue
     fpath = os.path.join(deploy_dir, fname)
     with open(fpath, 'r', encoding='utf-8') as f:
         content = f.read()
-    stripped = cv_pattern.sub('', content)
-    if stripped != content:
-        with open(fpath, 'w', encoding='utf-8') as f:
-            f.write(stripped)
+    content = cv_pattern.sub('', content)
+    if agent_name:
+        content = subj_pattern.sub(f'<subjectName>{agent_name}</subjectName>', content)
+    with open(fpath, 'w', encoding='utf-8') as f:
+        f.write(content)
 PYSTRIP_CV
 
 info "Deploying ${TOTAL_SUITES} suite(s) to org..."
