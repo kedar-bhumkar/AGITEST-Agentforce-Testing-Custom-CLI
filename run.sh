@@ -61,6 +61,14 @@ AGENT_BOT_ID=""          # BotDefinition Id for Agent API
 AGENT_API_CONSUMER_KEY="${SF_AGENT_API_CONSUMER_KEY:-}"   # External Client App consumer key
 AGENT_API_CONSUMER_SECRET="${SF_AGENT_API_CONSUMER_SECRET:-}" # External Client App consumer secret
 AGENT_API_TOKEN=""          # OAuth token from client credentials flow
+AGENT_SESSION_MODE=""        # "per_test" or "per_file" (Agent API only)
+AGENT_PARALLEL_MODE=""       # "true" or "false" (per_file only)
+AGENT_MAX_WORKERS=3          # max parallel file workers
+TEST_TYPE="qa"               # "qa" or "benchmark"
+BENCHMARK_AGENT_NAMES=()    # DeveloperNames of selected benchmark agents
+BENCHMARK_AGENT_IDS=()      # BotDefinition IDs of selected benchmark agents
+BENCHMARK_AGENT_LABELS=()   # MasterLabels of selected benchmark agents
+BENCHMARK_EXECUTION="serial" # "parallel" or "serial" (agent-level for benchmark)
 
 # ── Parse CLI arguments ──────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -102,6 +110,9 @@ PYLASTRUN
                 [ -n "${LR_LLM_API_KEY:-}"      ] && LLM_API_KEY="$LR_LLM_API_KEY"
                 [ -n "${LR_CONSUMER_KEY:-}"     ] && AGENT_API_CONSUMER_KEY="$LR_CONSUMER_KEY"
                 [ -n "${LR_CONSUMER_SECRET:-}"  ] && AGENT_API_CONSUMER_SECRET="$LR_CONSUMER_SECRET"
+                [ -n "${LR_SESSION_MODE:-}"     ] && AGENT_SESSION_MODE="$LR_SESSION_MODE"
+                [ -n "${LR_PARALLEL_MODE:-}"    ] && AGENT_PARALLEL_MODE="$LR_PARALLEL_MODE"
+                [ -n "${LR_MAX_WORKERS:-}"      ] && AGENT_MAX_WORKERS="$LR_MAX_WORKERS"
                 [ -n "${LR_GEN_ENGINE:-}"       ] && GEN_ENGINE="$LR_GEN_ENGINE"
                 [ -n "${LR_GEN_LLM_PROVIDER:-}" ] && GEN_LLM_PROVIDER="$LR_GEN_LLM_PROVIDER"
                 [ -n "${LR_GEN_LLM_MODEL:-}"    ] && GEN_LLM_MODEL="$LR_GEN_LLM_MODEL"
@@ -147,6 +158,18 @@ PYLASTRUN
             AGENT_API_CONSUMER_SECRET="${2:-}"
             shift 2
             ;;
+        --session-mode)
+            AGENT_SESSION_MODE="${2:-per_test}"
+            shift 2
+            ;;
+        --parallel)
+            AGENT_PARALLEL_MODE="true"
+            shift 1
+            ;;
+        --max-workers)
+            AGENT_MAX_WORKERS="${2:-3}"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage:"
             echo "  Interactive:  ./run.sh"
@@ -163,6 +186,9 @@ PYLASTRUN
             echo "  --llm-model <m> Model name (required for Ollama, optional for others)"
             echo "  --consumer-key <k>   External Client App consumer key (Agent API)"
             echo "  --consumer-secret <s> External Client App consumer secret (Agent API)"
+            echo "  --session-mode <m>  Agent API session strategy: per_test (default) or per_file"
+            echo "  --parallel          Run spec files in parallel (per_file mode only)"
+            echo "  --max-workers <N>   Max parallel workers (default: 3, used with --parallel)"
             echo "  --help          Show this help"
             exit 0
             ;;
@@ -627,6 +653,22 @@ except Exception as e:
         fi
 
         ok "Agent API OAuth token obtained successfully."
+
+        # ── Ask test type (QA vs Benchmark) ────────────────────────────────
+        echo ""
+        echo -e "  ${BOLD}What type of tests do you want to run?${NC}"
+        echo -e "    ${BOLD}1)${NC} QA Tests    ${DIM}(single agent — standard evaluation)${NC}"
+        echo -e "    ${BOLD}2)${NC} Benchmark   ${DIM}(compare multiple agents side-by-side)${NC}"
+        echo ""
+        while true; do
+            read -p "  Select (1/2) [default: 1]: " _type_choice
+            _type_choice=$(echo "$_type_choice" | tr -d '\r')
+            case "$_type_choice" in
+                2) TEST_TYPE="benchmark"; ok "Benchmark mode selected."; break ;;
+                1|"") TEST_TYPE="qa"; ok "QA mode selected."; break ;;
+                *) echo -e "  ${RED}Enter 1 or 2.${NC}" ;;
+            esac
+        done
     fi
 else
     # Direct mode: default to testing_center if not specified
@@ -796,28 +838,17 @@ except Exception as e:
     # ── Step 6: Select ───────────────────────────────────────────────────
     step 6 14 "Select Agent"
 
-    while true; do
-        read -p "  Select an agent (number): " agent_choice
-        if [[ "$agent_choice" =~ ^[0-9]+$ ]] && [ "$agent_choice" -ge 1 ] && [ "$agent_choice" -le "${#AGENT_NAMES[@]}" ]; then
-            AGENT_NAME="${AGENT_NAMES[$((agent_choice-1))]}"
-            SELECTED_BOT_DEF_ID="${AGENT_IDS[$((agent_choice-1))]}"
-            break
-        else
-            echo -e "  ${RED}Invalid selection. Enter a number between 1 and ${#AGENT_NAMES[@]}.${NC}"
-        fi
-    done
-
-    ok "Selected agent: ${AGENT_LABELS[$((agent_choice-1))]} ($AGENT_NAME)"
-
-    # ── Show version info for selected agent ────────────────────────────────
-    _bv_json_file=$(mktemp)
-    run_sf data query \
-        --query "SELECT Id, VersionNumber, Status FROM BotVersion WHERE BotDefinitionId = '${SELECTED_BOT_DEF_ID}' ORDER BY VersionNumber DESC LIMIT 1" \
-        --target-org "$ORG" --json > "$_bv_json_file" 2>/dev/null &
-    wait $!
-    _bv_json=$(cat "$_bv_json_file"); rm -f "$_bv_json_file"
-
-    _bv_info=$(echo "$_bv_json" | python3 -c "
+    # Helper: query and display BotVersion info for a given BotDefinition ID
+    # Prints: vN [Status] (colored), sets caller's _bv_id and _bv_status_out
+    _show_bot_version() {
+        local _def_id="$1" _label="$2"
+        local _vf=$(mktemp)
+        run_sf data query \
+            --query "SELECT Id, VersionNumber, Status FROM BotVersion WHERE BotDefinitionId = '${_def_id}' ORDER BY VersionNumber DESC LIMIT 1" \
+            --target-org "$ORG" --json > "$_vf" 2>/dev/null &
+        wait $!
+        local _vi
+        _vi=$(cat "$_vf" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -830,24 +861,109 @@ try:
 except:
     print('none||')
 " 2>/dev/null)
-
-    IFS='|' read -r _bv_num _bv_status _bv_id <<< "$_bv_info"
-    if [ "$_bv_num" = "none" ]; then
-        warn "No versions found for this agent."
-    else
-        if [ "$_bv_status" = "Active" ]; then
-            info "Version: v${_bv_num}  ${GREEN}[Active]${NC}"
+        rm -f "$_vf"
+        IFS='|' read -r _vnum _vstatus _vid <<< "$_vi"
+        _bv_id="$_vid"
+        if [ "$_vnum" = "none" ]; then
+            [ -n "$_label" ] && warn "  ${_label}: no version found." || warn "No versions found for this agent."
+        elif [ "$_vstatus" = "Active" ]; then
+            [ -n "$_label" ] \
+                && info "  ${_label}: v${_vnum} ${GREEN}[Active]${NC}" \
+                || info "Version: v${_vnum}  ${GREEN}[Active]${NC}"
         else
-            info "Version: v${_bv_num}  ${YELLOW}[${_bv_status}]${NC}"
-            if [ "$TEST_METHOD" = "agent_api" ]; then
-                warn "Agent is not Active — the Agent API requires an active/published version."
-                warn "Activate this agent in Agentforce Builder before running Agent API tests."
-            fi
+            [ -n "$_label" ] \
+                && info "  ${_label}: v${_vnum} ${YELLOW}[${_vstatus}]${NC}" \
+                || info "Version: v${_vnum}  ${YELLOW}[${_vstatus}]${NC}"
+            warn "${_label:+  ${_label}: }Agent is not Active — Agent API requires an active/published version."
         fi
+    }
+
+    if [ "$TEST_TYPE" != "benchmark" ]; then
+        # ── QA: single agent select ──────────────────────────────────────
+        while true; do
+            read -p "  Select an agent (number): " agent_choice
+            if [[ "$agent_choice" =~ ^[0-9]+$ ]] && [ "$agent_choice" -ge 1 ] && [ "$agent_choice" -le "${#AGENT_NAMES[@]}" ]; then
+                AGENT_NAME="${AGENT_NAMES[$((agent_choice-1))]}"
+                SELECTED_BOT_DEF_ID="${AGENT_IDS[$((agent_choice-1))]}"
+                break
+            else
+                echo -e "  ${RED}Invalid selection. Enter a number between 1 and ${#AGENT_NAMES[@]}.${NC}"
+            fi
+        done
+
+        ok "Selected agent: ${AGENT_LABELS[$((agent_choice-1))]} ($AGENT_NAME)"
+        _bv_id=""
+        _show_bot_version "$SELECTED_BOT_DEF_ID" ""
+
+    else
+        # ── Benchmark: multi-agent select ────────────────────────────────
+        echo ""
+        echo -e "  ${DIM}Select ≥2 agents to benchmark (comma-separated numbers, e.g. 1,3 — or 'all'):${NC}"
+        while true; do
+            read -p "  > " bench_input
+            bench_input=$(echo "$bench_input" | tr -d '\r' | tr '[:upper:]' '[:lower:]')
+            BENCHMARK_AGENT_NAMES=()
+            BENCHMARK_AGENT_IDS=()
+            BENCHMARK_AGENT_LABELS=()
+            if [ "$bench_input" = "all" ]; then
+                for i in "${!AGENT_NAMES[@]}"; do
+                    BENCHMARK_AGENT_NAMES+=("${AGENT_NAMES[$i]}")
+                    BENCHMARK_AGENT_IDS+=("${AGENT_IDS[$i]}")
+                    BENCHMARK_AGENT_LABELS+=("${AGENT_LABELS[$i]}")
+                done
+            else
+                IFS=',' read -ra _picks <<< "$bench_input"
+                _ok=true
+                for _p in "${_picks[@]}"; do
+                    _p=$(echo "$_p" | tr -d ' ')
+                    if [[ "$_p" =~ ^[0-9]+$ ]] && [ "$_p" -ge 1 ] && [ "$_p" -le "${#AGENT_NAMES[@]}" ]; then
+                        BENCHMARK_AGENT_NAMES+=("${AGENT_NAMES[$((_p-1))]}")
+                        BENCHMARK_AGENT_IDS+=("${AGENT_IDS[$((_p-1))]}")
+                        BENCHMARK_AGENT_LABELS+=("${AGENT_LABELS[$((_p-1))]}")
+                    else
+                        echo -e "  ${RED}Invalid: '$_p'. Numbers must be 1–${#AGENT_NAMES[@]}.${NC}"
+                        _ok=false; break
+                    fi
+                done
+                [ "$_ok" = false ] && continue
+            fi
+            if [ "${#BENCHMARK_AGENT_NAMES[@]}" -lt 2 ]; then
+                echo -e "  ${RED}Select at least 2 agents for benchmark.${NC}"; continue
+            fi
+            break
+        done
+
+        # First agent drives topic discovery
+        AGENT_NAME="${BENCHMARK_AGENT_NAMES[0]}"
+        SELECTED_BOT_DEF_ID="${BENCHMARK_AGENT_IDS[0]}"
+
+        echo ""
+        ok "Benchmark agents (${#BENCHMARK_AGENT_NAMES[@]}):"
+        _bv_id=""
+        for i in "${!BENCHMARK_AGENT_NAMES[@]}"; do
+            _show_bot_version "${BENCHMARK_AGENT_IDS[$i]}" "${BENCHMARK_AGENT_LABELS[$i]}"
+            # Capture first agent's BotVersion ID for topic discovery
+            [ "$i" -eq 0 ] && { _first_bv_id="$_bv_id"; }
+        done
+        _bv_id="$_first_bv_id"
+
+        # Benchmark execution mode
+        echo ""
+        echo -e "  ${BOLD}Run agents:${NC}"
+        echo -e "    ${BOLD}a)${NC} Serial    ${DIM}(agents run one after another — output interleaved)${NC}"
+        echo -e "    ${BOLD}b)${NC} Parallel  ${DIM}(agents run simultaneously)${NC}"
+        echo ""
+        read -p "  Select (a/b) [default: a]: " _exec_choice
+        _exec_choice=$(echo "$_exec_choice" | tr -d '\r')
+        case "$_exec_choice" in
+            b|B) BENCHMARK_EXECUTION="parallel"; ok "Parallel execution selected." ;;
+            *)   BENCHMARK_EXECUTION="serial";   ok "Serial execution selected." ;;
+        esac
     fi
 else
     # Direct mode: agent already set from --run arg
     SELECTED_BOT_DEF_ID=""
+    _bv_id=""
     info "Agent: $AGENT_NAME"
 fi
 
@@ -952,12 +1068,13 @@ if [ -n "$ACCESS_TOKEN" ] && [ -n "$INSTANCE_URL_API" ]; then
     #   2. GenAiPlannerFunctionDef: get Plugin IDs for those planners
     #   3. GenAiPluginDefinition: get plugin names, labels, descriptions
 
-    TOPICS_PARSED=$(python3 - "$ACCESS_TOKEN" "$INSTANCE_URL_API" "$AGENT_NAME" << 'PYTOPICS'
+    TOPICS_PARSED=$(python3 - "$ACCESS_TOKEN" "$INSTANCE_URL_API" "$AGENT_NAME" "${_bv_id:-}" << 'PYTOPICS'
 import sys, json, urllib.request, urllib.parse
 
 token = sys.argv[1]
 base = sys.argv[2]
 agent = sys.argv[3]
+active_bv_id = sys.argv[4] if len(sys.argv) > 4 else ""
 
 def soql(query):
     url = f"{base}/services/data/v66.0/query/?q={urllib.parse.quote(query)}"
@@ -968,9 +1085,29 @@ def soql(query):
     except Exception as e:
         return {"records": [], "error": str(e)}
 
-# Step 1: Find planner IDs for this agent (planners are named <AgentName>_v1, _v2, etc.)
-planners = soql(f"SELECT Id, DeveloperName FROM GenAiPlannerDefinition WHERE DeveloperName LIKE '{agent}_v%'")
-planner_ids = [r["Id"] for r in planners.get("records", [])]
+# Step 1: Find the planner for the ACTIVE BotVersion.
+# Primary: query GenAiPlannerDefinition directly by BotVersionId (most precise).
+# Fallback 1: sort all versioned planners numerically, take latest.
+# Fallback 2: exact name match (no version suffix).
+planner_ids = []
+
+if active_bv_id:
+    result = soql(f"SELECT Id, DeveloperName FROM GenAiPlannerDefinition WHERE BotVersionId = '{active_bv_id}'")
+    planner_ids = [r["Id"] for r in result.get("records", [])]
+
+if not planner_ids:
+    planners = soql(f"SELECT Id, DeveloperName FROM GenAiPlannerDefinition WHERE DeveloperName LIKE '{agent}_v%'")
+    planner_recs = planners.get("records", [])
+
+    def _planner_ver(rec):
+        dn = rec.get("DeveloperName", "")
+        try:
+            return int(dn.rsplit("_v", 1)[-1])
+        except Exception:
+            return 0
+
+    planner_recs.sort(key=_planner_ver, reverse=True)
+    planner_ids = [planner_recs[0]["Id"]] if planner_recs else []
 
 if not planner_ids:
     # Fallback: try exact match (some agents don't have version suffix)
@@ -1114,8 +1251,8 @@ else
     echo ""
 fi
 
-declare -A TOPIC_EXTRA_DETAILS
-declare -A TOPIC_CONTEXT_VARS   # JSON array of {name,type,value} per topic idx
+declare -a TOPIC_EXTRA_DETAILS
+declare -a TOPIC_CONTEXT_VARS   # JSON array of {name,type,value} per topic idx
 
 if [ "$DIRECT_MODE" = false ]; then
     # ── Interactive topic selection ──────────────────────────────────────
@@ -1208,6 +1345,8 @@ ${line}"
 
         if [[ "$vars_choice" =~ ^[yY] ]]; then
             echo -e "  ${DIM}Supported types: Text, Number, Boolean, Date, DateTime, Currency, Id${NC}"
+            echo -e "  ${DIM}Tip: for linked variables (sourced from a Salesforce record field),${NC}"
+            echo -e "  ${DIM}prefix the name with \$Context. — e.g. \$Context.Internal_Id${NC}"
             echo -e "  ${DIM}Leave variable name empty to finish.${NC}"
             vars_json="["
             first_var=true
@@ -1305,7 +1444,7 @@ case "$gen_choice" in
                     1) GEN_LLM_PROVIDER="openai";  GEN_LLM_MODEL="gpt-4o"; break ;;
                     2) GEN_LLM_PROVIDER="claude";  GEN_LLM_MODEL="claude-sonnet-4-20250514"; break ;;
                     3) GEN_LLM_PROVIDER="gemini";  GEN_LLM_MODEL="gemini-2.0-flash"; break ;;
-                    4) GEN_LLM_PROVIDER="ollama";  GEN_LLM_MODEL="llama3"; break ;;
+                    4) GEN_LLM_PROVIDER="ollama";  GEN_LLM_MODEL="gemma4:e4b"; break ;;
                     *) echo -e "  ${RED}Enter 1, 2, 3, or 4.${NC}" ;;
                 esac
             done
@@ -1355,7 +1494,7 @@ case "$gen_choice" in
                 ollama)
                     GEN_LLM_API_KEY="ollama"
                     echo ""
-                    read -p "  Enter Ollama model name [default: llama3]: " ollama_gen_model
+                    read -p "  Enter Ollama model name [default: gemma4:e4b]: " ollama_gen_model
                     [ -n "$ollama_gen_model" ] && GEN_LLM_MODEL="$ollama_gen_model"
                     read -p "  Enter Ollama URL [default: http://localhost:11434]: " ollama_gen_url
                     [ -n "$ollama_gen_url" ] && OLLAMA_URL="$ollama_gen_url"
@@ -2294,11 +2433,11 @@ except Exception as e:
                     fi
 
                     if [ -z "$LLM_MODEL" ]; then
-                        read -p "  Enter Ollama model name [default: llama3]: " ollama_model
+                        read -p "  Enter Ollama model name [default: gemma4:e4b]: " ollama_model
                         if [ -n "$ollama_model" ]; then
                             LLM_MODEL="$ollama_model"
                         else
-                            LLM_MODEL="llama3"
+                            LLM_MODEL="gemma4:e4b"
                         fi
                     fi
                     ok "Using Ollama model: $LLM_MODEL"
@@ -2307,6 +2446,43 @@ except Exception as e:
                 fi
                 ;;
         esac
+
+        # ── Session mode prompt (interactive mode only) ─────────────────────
+        if [ -z "$AGENT_SESSION_MODE" ]; then
+            echo ""
+            echo -e "  Select Agent API session strategy:"
+            echo -e "    ${BOLD}1)${NC} Independent session per test  ${DIM}(default — fully isolated, one session per utterance)${NC}"
+            echo -e "    ${BOLD}2)${NC} Shared session per file        ${DIM}(stateful — all test cases in a spec file share one session)${NC}"
+            echo ""
+            while true; do
+                read -p "  Select (1/2) [1]: " sess_choice
+                sess_choice="${sess_choice:-1}"
+                case "$sess_choice" in
+                    1) AGENT_SESSION_MODE="per_test"; break ;;
+                    2) AGENT_SESSION_MODE="per_file"; break ;;
+                    *) echo -e "  ${RED}Enter 1 or 2.${NC}" ;;
+                esac
+            done
+        fi
+        info "Session mode: $AGENT_SESSION_MODE"
+
+        # ── Parallel prompt (per_file only) ────────────────────────────────
+        if [ "$AGENT_SESSION_MODE" = "per_file" ] && [ -z "$AGENT_PARALLEL_MODE" ]; then
+            echo ""
+            read -p "  Run spec files in parallel? (y/n) [n]: " par_choice
+            par_choice="${par_choice:-n}"
+            if [[ "$par_choice" =~ ^[yY] ]]; then
+                AGENT_PARALLEL_MODE="true"
+                read -p "  Max parallel workers [${AGENT_MAX_WORKERS}]: " mw_input
+                if [ -n "$mw_input" ] && [[ "$mw_input" =~ ^[0-9]+$ ]]; then
+                    AGENT_MAX_WORKERS="$mw_input"
+                fi
+                info "Parallel mode enabled (max workers: ${AGENT_MAX_WORKERS})."
+            else
+                AGENT_PARALLEL_MODE="false"
+                info "Parallel mode disabled — files will run sequentially."
+            fi
+        fi
     else
         # Direct mode: validate LLM provider is set
         if [ -z "$LLM_PROVIDER" ]; then
@@ -2339,6 +2515,10 @@ except Exception as e:
             die "No API key for $LLM_PROVIDER. Use --llm-key or set the appropriate env var."
         fi
 
+        # Direct mode defaults
+        [ -z "$AGENT_SESSION_MODE" ]   && AGENT_SESSION_MODE="per_test"
+        [ -z "$AGENT_PARALLEL_MODE" ]  && AGENT_PARALLEL_MODE="false"
+
         info "LLM: $LLM_PROVIDER ($LLM_MODEL)"
     fi
 fi
@@ -2356,6 +2536,10 @@ if [ "$DIRECT_MODE" = false ]; then
     else
         echo -e "  Ready to run ${BOLD}${TOTAL_TESTS}${NC} test(s) across ${BOLD}${TOTAL_SUITES}${NC} suite(s) via ${BOLD}Agent API${NC}."
         echo -e "  LLM evaluator: ${BOLD}${LLM_PROVIDER}${NC} (${LLM_MODEL})"
+        echo -e "  Session mode:  ${BOLD}${AGENT_SESSION_MODE}${NC}"
+        if [ "$AGENT_SESSION_MODE" = "per_file" ] && [ "$AGENT_PARALLEL_MODE" = "true" ]; then
+            echo -e "  Parallel:      ${BOLD}enabled${NC} (max workers: ${AGENT_MAX_WORKERS})"
+        fi
         echo -e "  Target org: ${BOLD}${ORG}${NC}"
     fi
     echo ""
@@ -2413,27 +2597,33 @@ info "Deploying ${TOTAL_SUITES} suite(s) to org..."
 DEPLOY_OUT=$(cd "$DEPLOY_DIR" && run_sf project deploy start \
     --source-dir force-app \
     --target-org "$ORG" \
-    --json 2>&1) || true
+    --json 2>/dev/null) || true
 
 DEPLOY_STATUS=$(echo "$DEPLOY_OUT" | python3 -c "
 import sys, json
-try:
-    d = json.load(sys.stdin)
-    ok = d.get('result', {}).get('success', False)
-    if ok:
-        print('ok')
-    else:
-        failures = d.get('result', {}).get('details', {}).get('componentFailures', [])
-        if failures:
-            for f in failures:
-                fn = f.get('fullName', '?')
-                prob = f.get('problem', '?')
-                print(f'FAIL: {fn}: {prob}')
+raw = sys.stdin.read()
+# sf CLI sometimes emits non-JSON warnings before the JSON object; scan forward
+start = raw.find('{')
+if start == -1:
+    print('FAIL: No JSON in deploy output — raw: ' + raw[:200].strip())
+else:
+    try:
+        d = json.loads(raw[start:])
+        ok = d.get('result', {}).get('success', False)
+        if ok:
+            print('ok')
         else:
-            msg = d.get('message', 'Unknown error')
-            print(f'FAIL: {msg}')
-except Exception as e:
-    print(f'FAIL: Could not parse deploy output: {e}')
+            failures = d.get('result', {}).get('details', {}).get('componentFailures', [])
+            if failures:
+                for f in failures:
+                    fn = f.get('fullName', '?')
+                    prob = f.get('problem', '?')
+                    print(f'FAIL: {fn}: {prob}')
+            else:
+                msg = d.get('message', 'Unknown error')
+                print(f'FAIL: {msg}')
+    except Exception as e:
+        print(f'FAIL: Could not parse deploy output: {e}')
 " 2>/dev/null)
 
 if [ "$DEPLOY_STATUS" = "ok" ]; then
@@ -2660,10 +2850,13 @@ for xml in "${SPEC_FILES[@]}"; do
     fi
 done
 
-PYTHONIOENCODING=utf-8 python3 -X utf8 - "$RUN_ACCESS_TOKEN" "$RUN_INSTANCE_URL" "$AGENT_BOT_ID" "$RESULTS_DIR" "$LLM_PROVIDER" "$LLM_API_KEY" "$LLM_MODEL" "$OLLAMA_URL" "$SPEC_LIST" << 'PYAGENTAPI'
-import sys, json, time, os, uuid, html, io
+# Save Python runner to a temp file so it can be called multiple times (benchmark)
+_py_runner=$(mktemp --suffix=.py)
+cat > "$_py_runner" << 'PYAGENTAPI'
+import sys, json, time, os, uuid, html, io, threading
 import xml.etree.ElementTree as ET
 import urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -2678,6 +2871,9 @@ llm_api_key = sys.argv[6]
 llm_model = sys.argv[7]
 ollama_url = sys.argv[8]
 spec_files = sys.argv[9].split("|")
+session_mode   = sys.argv[10] if len(sys.argv) > 10 else "per_test"   # "per_test" | "per_file"
+parallel_mode  = sys.argv[11] == "true" if len(sys.argv) > 11 else False
+max_workers    = int(sys.argv[12]) if len(sys.argv) > 12 else 3
 # Normalize MSYS/Git Bash paths (/c/foo -> C:/foo) on Windows
 import re as _re
 if sys.platform == "win32":
@@ -2777,23 +2973,15 @@ def parse_spec(xml_path):
     test_cases.sort(key=lambda x: x["number"])
     return suite_name, subject, test_cases
 
-# ── Helper: Send utterance via Agent API ───────────────────────────────────
-def run_agent_test(utterance, variables=None, retry_count=3):
-    """Create session, send utterance, get response, end session.
+# ── Agent API primitives ───────────────────────────────────────────────────
+def _create_session(variables, retry_count=3):
+    """Create an Agent API session. Returns (session_id, latency_ms, error_str).
 
     variables: list of {"name": str, "type": str, "value": str}
-      - $Context.* variables  → session body only (read-only after start)
-      - all other variables   → session body (initial value) + message body (allows editable update)
+      - $Context.* variables are read-only after session creation
+      - internal bot variables cannot be set via Agent API (only Testing Center)
     """
-    variables = variables or []
-
-    # Split: context vars go in session only; custom vars go in both
-    session_vars = variables
-    msg_vars     = [v for v in variables if not v["name"].startswith("$Context.")]
-
-    t_total_start = time.time()
-
-    # 1. Create session
+    session_vars = variables or []
     session_body = {
         "externalSessionKey": str(uuid.uuid4()),
         "instanceConfig": {"endpoint": instance_url},
@@ -2805,35 +2993,70 @@ def run_agent_test(utterance, variables=None, retry_count=3):
 
     session_url = f"https://api.salesforce.com/einstein/ai-agent/v1/agents/{agent_bot_id}/sessions"
     t0 = time.time()
-    session_resp = api_call("POST", session_url, session_body, agent_headers())
-    latency_session = round((time.time() - t0) * 1000)
+    resp = api_call("POST", session_url, session_body, agent_headers())
+    latency = round((time.time() - t0) * 1000)
 
-    if "error" in session_resp:
-        code = session_resp.get("httpStatusCode", 0)
+    if "error" in resp:
+        code = resp.get("httpStatusCode", 0)
         if code == 429 and retry_count > 0:
             time.sleep(2 ** (3 - retry_count))
-            return run_agent_test(utterance, variables, retry_count - 1)
-        err_detail = session_resp.get("error", "Unknown error")
+            return _create_session(variables, retry_count - 1)
+        err_detail = resp.get("error", "Unknown error")
         if isinstance(err_detail, dict):
             err_detail = err_detail.get("message", json.dumps(err_detail)[:200])
         err_str = str(err_detail)
         if "valid version" in err_str.lower() or "no valid" in err_str.lower():
             err_str = (f"No valid version available ({code}): The agent has no active/published version. "
                        "Open Agentforce Builder, activate the agent, then retry.")
+        elif any(exc in err_str for exc in (
+                "InternalVariableMutationAttemptException",
+                "LinkedVariableMutationAttemptException",
+        )) and session_vars and retry_count > 0:
+            # Identify the offending variable by name if Salesforce includes it in the error.
+            offender = next((v["name"] for v in session_vars if v["name"] in err_str), None)
+            if offender and not offender.startswith("$Context."):
+                # Linked variables must be sent as $Context.<name> — retry with the fix applied.
+                fixed_vars = [
+                    {**v, "name": f"$Context.{v['name']}"} if v["name"] == offender else v
+                    for v in session_vars
+                ]
+                print(
+                    f"  [WARN] Variable '{offender}' is a linked variable and must be sent as "
+                    f"'$Context.{offender}'. Retrying with corrected name.",
+                    file=sys.stderr,
+                )
+                return _create_session(fixed_vars, retry_count - 1)
+            else:
+                # Can't pinpoint offender or it's already prefixed — drop all and warn.
+                var_names = ", ".join(v["name"] for v in session_vars)
+                print(
+                    f"  [WARN] Session rejected variable(s): {var_names}.\n"
+                    "  If any are linked variables (sourced from a Salesforce record field like\n"
+                    "  MessagingSession.Internal_Id__c), rename them to '$Context.<name>' in the\n"
+                    "  spec XML — e.g. '$Context.Internal_Id' instead of 'Internal_Id'.\n"
+                    "  Retrying without variables.",
+                    file=sys.stderr,
+                )
+                return _create_session([], retry_count - 1)
         else:
             err_str = f"Session creation failed ({code}): {err_detail}"
-        return {"error": err_str, "response": "",
-                "latency_ms": latency_session, "latency_session_ms": latency_session, "latency_message_ms": 0}
+        return None, latency, err_str
 
-    session_id = session_resp.get("sessionId", "")
+    session_id = resp.get("sessionId", "")
     if not session_id:
-        return {"error": f"No sessionId in response: {json.dumps(session_resp)[:200]}", "response": "",
-                "latency_ms": latency_session, "latency_session_ms": latency_session, "latency_message_ms": 0}
+        return None, latency, f"No sessionId in response: {json.dumps(resp)[:200]}"
+    return session_id, latency, ""
 
-    # 2. Send utterance (include editable vars so they can be mutated per-turn)
+
+def _send_message(session_id, utterance, seq_id, variables=None):
+    """Send one utterance to an existing session. Returns (response_text, latency_ms).
+
+    variables: non-$Context vars that can be mutated per-turn.
+    """
+    msg_vars = [v for v in (variables or []) if not v["name"].startswith("$Context.")]
     msg_body = {
         "message": {
-            "sequenceId": 1,
+            "sequenceId": seq_id,
             "type": "Text",
             "text": utterance
         }
@@ -2844,64 +3067,88 @@ def run_agent_test(utterance, variables=None, retry_count=3):
     msg_url = f"https://api.salesforce.com/einstein/ai-agent/v1/sessions/{session_id}/messages"
     t0 = time.time()
     msg_resp = api_call("POST", msg_url, msg_body, agent_headers())
-    latency_message = round((time.time() - t0) * 1000)
+    latency = round((time.time() - t0) * 1000)
 
-    # Extract response text
-    response_text = ""
     if "error" in msg_resp:
         code = msg_resp.get("httpStatusCode", 0)
         err_detail = msg_resp.get("error", "Unknown error")
         if isinstance(err_detail, dict):
             err_detail = err_detail.get("message", json.dumps(err_detail)[:200])
-        response_text = f"[ERROR: Message send failed ({code}): {err_detail}]"
-    else:
-        messages = msg_resp.get("messages", [])
-        text_parts = []
-        for m in messages:
-            msg_type = m.get("type", "")
-            if msg_type in ("Inform", "TextChunk"):
-                text = m.get("message", "") or m.get("text", "") or m.get("value", "")
-                if text:
-                    text_parts.append(text)
-        response_text = " ".join(text_parts) if text_parts else "(empty response)"
+        return f"[ERROR: Message send failed ({code}): {err_detail}]", latency
 
-    # 3. End session (DELETE with reason header)
+    messages = msg_resp.get("messages", [])
+    text_parts = []
+    for m in messages:
+        if m.get("type") in ("Inform", "TextChunk"):
+            text = m.get("message", "") or m.get("text", "") or m.get("value", "")
+            if text:
+                text_parts.append(text)
+    return " ".join(text_parts) if text_parts else "(empty response)", latency
+
+
+def _end_session(session_id):
+    """DELETE an Agent API session."""
     end_url = f"https://api.salesforce.com/einstein/ai-agent/v1/sessions/{session_id}"
-    end_headers = {**agent_headers(), "x-session-end-reason": "UserRequest"}
-    api_call("DELETE", end_url, None, end_headers)
+    api_call("DELETE", end_url, None, {**agent_headers(), "x-session-end-reason": "UserRequest"})
+
+
+# ── per_test convenience wrapper (backward-compatible) ─────────────────────
+def run_agent_test(utterance, variables=None, retry_count=3):
+    """Create session, send one utterance, end session. Returns result dict."""
+    t_total_start = time.time()
+    session_id, lat_sess, err = _create_session(variables or [], retry_count)
+    if err:
+        return {"error": err, "response": "",
+                "latency_ms": lat_sess, "latency_session_ms": lat_sess, "latency_message_ms": 0}
+
+    response_text, lat_msg = _send_message(session_id, utterance, seq_id=1, variables=variables)
+    _end_session(session_id)
 
     latency_total = round((time.time() - t_total_start) * 1000)
     return {
         "error": "", "response": response_text,
         "latency_ms": latency_total,
-        "latency_session_ms": latency_session,
-        "latency_message_ms": latency_message,
+        "latency_session_ms": lat_sess,
+        "latency_message_ms": lat_msg,
     }
 
 # ── Helper: LLM evaluation ────────────────────────────────────────────────
 def evaluate_with_llm(expected, actual):
     """Send expected/actual to chosen LLM and get PASS/FAIL + score."""
-    prompt = f"""You are a QA evaluator for an AI agent. Compare the expected behavior with the actual agent response.
+    prompt = f"""You are a pass/fail QA checker. Follow these rules exactly.
 
-Expected behavior: {expected}
+════ WHAT TO CHECK ════
+Check ONLY these two things:
+  CHECK-1 (JSON): Is the actual response valid JSON?
+  CHECK-2 (CORE ELEMENTS): Are the core elements from the expected behavior present with correct values?
 
-Actual agent response: {actual}
+Core elements = patient identity (memberId, firstName, lastName, dateOfBirth) and drug/order fields (drugname, formStrengthName, status, parentStatus, subStatus, orderDate).
 
-Evaluate whether the actual response satisfies the expected behavior.
+════ WHAT TO IGNORE — DO NOT PENALIZE FOR THESE ════
+- Extra JSON keys not in the core element list above (e.g. preheader, formType, carrier, shipmentAddress, trackingId, carrierTracking, line, city, state, postalCode)
+- Extra whitespace, different key order, or empty-string values ""
+- postComments content unless it is a question blocking resolution
+- Any field not explicitly listed in the expected behavior
 
-Return ONLY a JSON object with these exact keys:
-{{"result": "PASS" or "FAIL", "score": <integer 0-5>, "explanation": "<brief explanation>"}}
+════ EXPECTED BEHAVIOR ════
+{expected}
 
-Scoring guide:
-- 5: Perfect match, fully satisfies expected behavior
-- 4: Mostly correct, minor omissions
-- 3: Partially correct, some key elements missing
-- 2: Weakly related, significant gaps
-- 1: Barely relevant
-- 0: Completely wrong or off-topic
+════ ACTUAL AGENT RESPONSE ════
+{actual}
 
-PASS if score >= 3, FAIL otherwise.
-Return ONLY the JSON object, no other text."""
+════ SCORING — USE ONLY THESE VALUES ════
+5 = CHECK-1 PASS + CHECK-2 PASS: JSON valid, all core elements present and correct
+4 = CHECK-1 PASS + CHECK-2 mostly PASS: JSON valid, nearly all core elements correct, at most one minor value difference
+3 = CHECK-1 PASS + CHECK-2 partial: JSON valid, patient identity correct, at least one drug/order field correct
+2 = CHECK-1 PASS + CHECK-2 FAIL: JSON valid but core elements are wrong or mostly missing
+1 = CHECK-1 FAIL: response is not valid JSON but some recognizable content is present
+0 = Response is empty, completely off-topic, or an error message
+
+PASS if score >= 3. FAIL if score <= 2.
+
+════ OUTPUT FORMAT — NOTHING ELSE ════
+Return ONLY this JSON object with no extra text, no markdown, no explanation outside the JSON:
+{{"result": "PASS" or "FAIL", "score": <integer 0-5>, "explanation": "<one sentence max>"}}"""
 
     try:
         if llm_provider == "openai":
@@ -2954,6 +3201,13 @@ Return ONLY the JSON object, no other text."""
             headers = {"Content-Type": "application/json"}
             body = {
                 "model": llm_model,
+                "system": (
+                    "You are a strict JSON-output QA checker. "
+                    "You ONLY evaluate two things: (1) is the response valid JSON, and (2) are the core elements correct. "
+                    "You MUST ignore all extra JSON keys not in the core element list. "
+                    "You MUST output ONLY a valid JSON object with keys: result, score, explanation. "
+                    "No markdown. No extra text. No commentary outside the JSON object."
+                ),
                 "prompt": prompt,
                 "stream": False,
                 "format": "json"
@@ -2981,126 +3235,412 @@ Return ONLY the JSON object, no other text."""
     except Exception as e:
         return {"result": "FAIL", "score": 0, "explanation": f"LLM evaluation error: {str(e)[:150]}"}
 
-# ── Main: Process each spec file ──────────────────────────────────────────
-for spec_path in spec_files:
+# ── Helper: process one test case and append to result_cases ──────────────
+def _process_test_case(tc, i, total, session_id, seq_id):
+    """Send utterance, evaluate, return (result_case_dict, latency_msg_ms).
+
+    session_id: existing session to reuse, or None to create+destroy per call.
+    seq_id:     sequenceId to use for the message (incremented by caller in per_file mode).
+    Returns result_case dict.
+    """
+    num           = tc["number"]
+    utterance     = tc["utterance"]
+    expected      = tc["expected_output"]
+    variables     = tc.get("variables", [])
+
+    short_utt = utterance[:50] + "..." if len(utterance) > 50 else utterance
+    var_hint  = f" {DIM}[+{len(variables)} var(s)]{NC}" if variables else ""
+    print(f"    {CYAN}[{i+1}/{total}]{NC} Sending: \"{short_utt}\"{var_hint}", end="", flush=True)
+
+    fmt = lambda ms: f"{ms/1000:.2f}s"
+
+    if session_id is None:
+        # per_test: full create→send→delete cycle
+        agent_result = run_agent_test(utterance, variables=variables)
+        lat_total = agent_result.get("latency_ms", 0)
+        lat_sess  = agent_result.get("latency_session_ms", 0)
+        lat_msg   = agent_result.get("latency_message_ms", 0)
+        lat_color = GREEN if lat_total < 3000 else YELLOW if lat_total < 8000 else RED
+        lat_str   = f" {DIM}[{lat_color}{fmt(lat_total)}{NC}{DIM} · session:{fmt(lat_sess)} msg:{fmt(lat_msg)}]{NC}"
+        error     = agent_result["error"]
+        actual    = agent_result["response"]
+    else:
+        # per_file: reuse existing session, just send message
+        actual, lat_msg = _send_message(session_id, utterance, seq_id, variables=variables)
+        lat_color = GREEN if lat_msg < 3000 else YELLOW if lat_msg < 8000 else RED
+        lat_str   = f" {DIM}[{lat_color}{fmt(lat_msg)}{NC}{DIM} · msg]{NC}"
+        error     = actual if actual.startswith("[ERROR:") else ""
+        if error:
+            actual = ""
+
+    lat_ms = lat_total if session_id is None else lat_msg
+
+    if error:
+        print(f"  {RED}ERROR{NC}{lat_str}")
+        print(f"      {RED}{error[:100]}{NC}")
+        return {
+            "testNumber": num,
+            "latency_ms": lat_ms,
+            "status": "ERROR",
+            "inputs": {"utterance": utterance, "variables": variables},
+            "generatedData": {"topic": "agent_api", "outcome": error},
+            "testResults": [{
+                "name": "output_validation",
+                "result": "FAILURE",
+                "score": 0.0,
+                "metricExplainability": error,
+                "expectedValue": expected,
+                "actualValue": error,
+                "errorCode": 0,
+                "status": "ERROR"
+            }]
+        }
+
+    print(f"  {GREEN}OK{NC}{lat_str}", flush=True)
+
+    print(f"      {DIM}Evaluating with {llm_provider}...{NC}", end="", flush=True)
+    eval_result = evaluate_with_llm(expected, actual)
+
+    tag = f"{GREEN}PASS{NC}" if eval_result["result"] == "PASS" else f"{RED}FAIL{NC}"
+    print(f"  [{tag}] score={eval_result['score']}/5")
+
+    if eval_result["result"] != "PASS":
+        short_actual = actual[:80] + "..." if len(actual) > 80 else actual
+        print(f"      {RED}Agent: {short_actual}{NC}")
+        print(f"      {YELLOW}Why:   {eval_result['explanation'][:100]}{NC}")
+
+    return {
+        "testNumber": num,
+        "latency_ms": lat_ms,
+        "status": "COMPLETED",
+        "inputs": {"utterance": utterance, "variables": variables},
+        "generatedData": {"topic": "agent_api", "outcome": actual},
+        "testResults": [{
+            "name": "output_validation",
+            "metricLabel": "output_validation",
+            "result": eval_result["result"],
+            "score": float(eval_result["score"]),
+            "metricExplainability": eval_result["explanation"],
+            "expectedValue": expected,
+            "actualValue": actual,
+            "errorCode": 0,
+            "status": "COMPLETED"
+        }]
+    }
+
+
+# ── Helper: run one spec file (used for both serial and parallel paths) ───
+print_lock = threading.Lock()
+
+def _run_spec_file(spec_path):
+    """Process all test cases in one spec file. Thread-safe: buffers output,
+    flushes atomically via print_lock so parallel runs don't interleave."""
     suite_name, subject, test_cases = parse_spec(spec_path)
     if not suite_name:
         suite_name = os.path.basename(spec_path).replace(".aiEvaluationDefinition-meta.xml", "")
 
     total = len(test_cases)
-    print(f"\n  {BOLD}{suite_name}{NC}  ({total} test cases)")
-    print(f"  {'─'*68}")
+    mode_label = "per-file session" if session_mode == "per_file" else "independent session per test"
+
+    # Buffer all output for this file so parallel runs print atomically
+    buf = []
+    buf.append(f"\n  {BOLD}{suite_name}{NC}  ({total} test cases, {mode_label})")
+    buf.append(f"  {'─'*68}")
 
     result_cases = []
+    t_file_start = time.time()
 
-    for i, tc in enumerate(test_cases):
-        num = tc["number"]
-        utterance = tc["utterance"]
-        expected = tc["expected_output"]
-        expected_topic = tc["expected_topic"]
-        variables = tc.get("variables", [])
+    if session_mode == "per_file":
+        session_vars = test_cases[0].get("variables", []) if test_cases else []
+        t0 = time.time()
+        session_id, lat_sess, sess_err = _create_session(session_vars)
+        lat_sess_ms = round((time.time() - t0) * 1000)
 
-        short_utt = utterance[:50] + "..." if len(utterance) > 50 else utterance
-        var_hint = f" {DIM}[+{len(variables)} var(s)]{NC}" if variables else ""
-        print(f"    {CYAN}[{i+1}/{total}]{NC} Sending: \"{short_utt}\"{var_hint}", end="", flush=True)
-
-        # Send to Agent API (with any spec-defined context/custom variables)
-        agent_result = run_agent_test(utterance, variables=variables)
-
-        lat_total = agent_result.get("latency_ms", 0)
-        lat_sess  = agent_result.get("latency_session_ms", 0)
-        lat_msg   = agent_result.get("latency_message_ms", 0)
-        lat_color = GREEN if lat_total < 3000 else YELLOW if lat_total < 8000 else RED
-        fmt = lambda ms: f"{ms/1000:.2f}s"
-        lat_str   = f" {DIM}[{lat_color}{fmt(lat_total)}{NC}{DIM} · session:{fmt(lat_sess)} msg:{fmt(lat_msg)}]{NC}"
-
-        if agent_result["error"]:
-            print(f"  {RED}ERROR{NC}{lat_str}")
-            print(f"      {RED}{agent_result['error'][:100]}{NC}")
-            result_cases.append({
-                "testNumber": num,
-                "status": "ERROR",
-                "inputs": {"utterance": utterance, "variables": variables},
-                "generatedData": {"topic": "agent_api", "outcome": agent_result["error"]},
-                "testResults": [{
-                    "name": "output_validation",
-                    "result": "FAILURE",
-                    "score": 0.0,
-                    "metricExplainability": agent_result["error"],
-                    "expectedValue": expected,
-                    "actualValue": agent_result["error"],
-                    "errorCode": 0,
-                    "status": "ERROR"
-                }]
-            })
+        if sess_err:
+            buf.append(f"  {RED}Session creation failed — all {total} test(s) blocked:{NC}")
+            buf.append(f"  {RED}{sess_err[:120]}{NC}")
+            for tc in test_cases:
+                result_cases.append({
+                    "testNumber": tc["number"],
+                    "status": "ERROR",
+                    "inputs": {"utterance": tc["utterance"], "variables": tc.get("variables", [])},
+                    "generatedData": {"topic": "agent_api", "outcome": sess_err},
+                    "testResults": [{
+                        "name": "output_validation",
+                        "result": "FAILURE",
+                        "score": 0.0,
+                        "metricExplainability": sess_err,
+                        "expectedValue": tc["expected_output"],
+                        "actualValue": sess_err,
+                        "errorCode": 0,
+                        "status": "ERROR"
+                    }]
+                })
+        else:
+            buf.append(f"  {DIM}Session created in {lat_sess_ms/1000:.2f}s{NC}")
+            for i, tc in enumerate(test_cases):
+                # Capture per-test output into buffer by redirecting stdout temporarily
+                captured = io.StringIO()
+                old_stdout = sys.stdout
+                sys.stdout = captured
+                rc = _process_test_case(tc, i, total, session_id=session_id, seq_id=i + 1)
+                sys.stdout = old_stdout
+                buf.append(captured.getvalue().rstrip())
+                result_cases.append(rc)
+                time.sleep(0.5)
+            _end_session(session_id)
+            buf.append(f"  {DIM}Session closed.{NC}")
+    else:
+        for i, tc in enumerate(test_cases):
+            captured = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = captured
+            rc = _process_test_case(tc, i, total, session_id=None, seq_id=1)
+            sys.stdout = old_stdout
+            buf.append(captured.getvalue().rstrip())
+            result_cases.append(rc)
             time.sleep(0.5)
-            continue
 
-        actual = agent_result["response"]
-        print(f"  {GREEN}OK{NC}{lat_str}", flush=True)
+    # Per-file analytics
+    file_elapsed_ms = round((time.time() - t_file_start) * 1000)
+    passed  = sum(1 for rc in result_cases
+                  for tr in rc.get("testResults", []) if tr.get("result") == "PASS")
+    failed  = sum(1 for rc in result_cases
+                  for tr in rc.get("testResults", []) if tr.get("result") not in ("PASS",))
+    errors  = sum(1 for rc in result_cases if rc.get("status") == "ERROR")
+    pct     = (passed * 100 // total) if total > 0 else 0
+    p_color = GREEN if pct >= 80 else YELLOW if pct >= 60 else RED
+    buf.append(f"\n  {BOLD}File summary:{NC} {p_color}{passed}/{total} passed ({pct}%){NC}"
+               f"  {DIM}failed={failed} errors={errors} elapsed={file_elapsed_ms/1000:.1f}s{NC}")
 
-        # Evaluate with LLM
-        print(f"      {DIM}Evaluating with {llm_provider}...{NC}", end="", flush=True)
-        eval_result = evaluate_with_llm(expected, actual)
-
-        tag = f"{GREEN}PASS{NC}" if eval_result["result"] == "PASS" else f"{RED}FAIL{NC}"
-        print(f"  [{tag}] score={eval_result['score']}/5")
-
-        if eval_result["result"] != "PASS":
-            short_actual = actual[:80] + "..." if len(actual) > 80 else actual
-            print(f"      {RED}Agent: {short_actual}{NC}")
-            short_explain = eval_result["explanation"][:100]
-            print(f"      {YELLOW}Why:   {short_explain}{NC}")
-
-        result_cases.append({
-            "testNumber": num,
-            "status": "COMPLETED",
-            "inputs": {"utterance": utterance, "variables": variables},
-            "generatedData": {"topic": "agent_api", "outcome": actual},
-            "testResults": [{
-                "name": "output_validation",
-                "metricLabel": "output_validation",
-                "result": eval_result["result"],
-                "score": float(eval_result["score"]),
-                "metricExplainability": eval_result["explanation"],
-                "expectedValue": expected,
-                "actualValue": actual,
-                "errorCode": 0,
-                "status": "COMPLETED"
-            }]
-        })
-
-        time.sleep(0.5)  # Small delay between tests
+    # Flush output atomically
+    with print_lock:
+        print("\n".join(buf), flush=True)
 
     # Save results
     result_data = {
         "result": {
             "status": "COMPLETED",
             "subjectName": subject,
+            "sessionMode": session_mode,
             "testCases": result_cases,
         },
         "status": 0,
         "message": ""
     }
-
     result_path = os.path.join(results_dir, f"{suite_name}.json")
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result_data, f, indent=2, ensure_ascii=False)
 
-    # Suite summary
-    passed = sum(1 for tc in result_cases
-                 for tr in tc.get("testResults", [])
-                 if tr.get("result") == "PASS")
-    print(f"\n  {GREEN}{passed}/{total}{NC} passed for {suite_name}")
+    return suite_name, passed, total
+
+
+# ── Main: Process each spec file ──────────────────────────────────────────
+mode_label = "per-file session" if session_mode == "per_file" else "independent session per test"
+run_parallel = parallel_mode and session_mode == "per_file"
+
+if run_parallel:
+    print(f"  {DIM}Session mode: {mode_label} | parallel: {max_workers} workers{NC}")
+else:
+    print(f"  {DIM}Session mode: {mode_label}{NC}")
+
+if run_parallel:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_run_spec_file, sp): sp for sp in spec_files}
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as exc:
+                sp = futures[fut]
+                with print_lock:
+                    print(f"  {RED}ERROR processing {os.path.basename(sp)}: {exc}{NC}", flush=True)
+else:
+    for spec_path in spec_files:
+        _run_spec_file(spec_path)
 
 print(f"\n  {GREEN}All Agent API test runs completed.{NC}")
 PYAGENTAPI
+
+# ── QA mode: single agent run ────────────────────────────────────────────────
+if [ "$TEST_TYPE" != "benchmark" ]; then
+    PYTHONIOENCODING=utf-8 python3 -X utf8 "$_py_runner" \
+        "$RUN_ACCESS_TOKEN" "$RUN_INSTANCE_URL" "$AGENT_BOT_ID" "$RESULTS_DIR" \
+        "$LLM_PROVIDER" "$LLM_API_KEY" "$LLM_MODEL" "$OLLAMA_URL" "$SPEC_LIST" \
+        "${AGENT_SESSION_MODE:-per_test}" "${AGENT_PARALLEL_MODE:-false}" "${AGENT_MAX_WORKERS:-3}"
+    rm -f "$_py_runner"
+
+# ── Benchmark mode: run each agent, then compare ─────────────────────────────
+else
+    BENCHMARK_PIDS=()
+    BENCHMARK_RESULT_DIRS=()
+
+    for _bi in "${!BENCHMARK_AGENT_NAMES[@]}"; do
+        _bname="${BENCHMARK_AGENT_NAMES[$_bi]}"
+        _bid="${BENCHMARK_AGENT_IDS[$_bi]}"
+        _blabel="${BENCHMARK_AGENT_LABELS[$_bi]}"
+        _safe=$(echo "$_bname" | sed 's/[^a-zA-Z0-9_]/_/g')
+        _rdir="${RESULTS_DIR}/benchmark_${_safe}"
+        mkdir -p "$_rdir"
+        BENCHMARK_RESULT_DIRS+=("$_rdir")
+
+        echo ""
+        info "[$((${_bi}+1))/${#BENCHMARK_AGENT_NAMES[@]}] Running: ${_blabel} (${_bname})..."
+
+        if [ "$BENCHMARK_EXECUTION" = "parallel" ]; then
+            PYTHONIOENCODING=utf-8 python3 -X utf8 "$_py_runner" \
+                "$RUN_ACCESS_TOKEN" "$RUN_INSTANCE_URL" "$_bid" \
+                "$_rdir" "$LLM_PROVIDER" "$LLM_API_KEY" "$LLM_MODEL" \
+                "$OLLAMA_URL" "$SPEC_LIST" "per_test" "false" "3" &
+            BENCHMARK_PIDS+=($!)
+        else
+            PYTHONIOENCODING=utf-8 python3 -X utf8 "$_py_runner" \
+                "$RUN_ACCESS_TOKEN" "$RUN_INSTANCE_URL" "$_bid" \
+                "$_rdir" "$LLM_PROVIDER" "$LLM_API_KEY" "$LLM_MODEL" \
+                "$OLLAMA_URL" "$SPEC_LIST" "per_test" "false" "3"
+        fi
+    done
+
+    if [ "$BENCHMARK_EXECUTION" = "parallel" ]; then
+        info "Waiting for all agents to finish..."
+        for _pid in "${BENCHMARK_PIDS[@]}"; do wait "$_pid" || true; done
+    fi
+
+    rm -f "$_py_runner"
+
+    # ── Benchmark comparison table ────────────────────────────────────────
+    echo ""
+    _rdirs_arg=$(IFS='|'; echo "${BENCHMARK_RESULT_DIRS[*]}")
+    _labels_arg=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
+
+    PYTHONIOENCODING=utf-8 python3 -X utf8 - "$_rdirs_arg" "$_labels_arg" << 'PYBENCHMARK'
+import sys, json, os, glob, io
+
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
+GREEN  = "\033[0;32m"
+YELLOW = "\033[1;33m"
+RED    = "\033[0;31m"
+CYAN   = "\033[0;36m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+NC     = "\033[0m"
+
+result_dirs  = sys.argv[1].split("|")
+agent_labels = sys.argv[2].split("|")
+
+rows = []
+for label, rdir in zip(agent_labels, result_dirs):
+    files = glob.glob(os.path.join(rdir, "*.json"))
+    total = pass_ = 0
+    latencies = []
+    for fpath in sorted(files):
+        try:
+            data = json.load(open(fpath, encoding="utf-8"))
+        except Exception:
+            continue
+        for tc in data.get("result", {}).get("testCases", []):
+            total += 1
+            lat = tc.get("latency_ms", 0)
+            if lat:
+                latencies.append(lat)
+            for tr in tc.get("testResults", []):
+                if tr.get("name") == "output_validation" and tr.get("result") == "PASS":
+                    pass_ += 1
+    pct     = round(pass_ / total * 100, 1) if total else 0.0
+    avg_lat = round(sum(latencies) / len(latencies) / 1000, 2) if latencies else 0.0
+    min_lat = round(min(latencies) / 1000, 2) if latencies else 0.0
+    max_lat = round(max(latencies) / 1000, 2) if latencies else 0.0
+    rows.append((label, pct, pass_, total - pass_, total, avg_lat, min_lat, max_lat))
+
+# Sort by pass % descending (winner first)
+rows.sort(key=lambda r: -r[1])
+
+# Column widths
+w_agent = max(len("Agent"), max((len(r[0]) for r in rows), default=0))
+w_pct   = 7   # "100.0%"
+w_pass  = 4
+w_fail  = 4
+w_total = 5
+w_avg   = 7
+w_min   = 6
+w_max   = 6
+
+def cell(val, width, align="<"):
+    return f"{val:{align}{width}}"
+
+# Box chars
+TL, TR, BL, BR = "╔", "╗", "╚", "╝"
+ML, MR         = "╠", "╣"
+TM, BM, MM     = "╦", "╩", "╬"
+H, V           = "═", "║"
+
+cols = [w_agent, w_pct, w_pass, w_fail, w_total, w_avg, w_min, w_max]
+headers = ["Agent", "Pass%", "Pass", "Fail", "Total", "Avg Lat", "Min", "Max"]
+
+def hline(left, mid, right, fill=H):
+    return left + mid.join(fill * (c + 2) for c in cols) + right
+
+print()
+print(f"  {BOLD}{CYAN}{'BENCHMARK COMPARISON':^{sum(cols) + len(cols)*3 + len(cols)-1}}{NC}")
+print("  " + hline(TL, TM, TR))
+hdr = V + V.join(f" {cell(h, cols[i], '^')} " for i, h in enumerate(headers)) + V
+print("  " + hdr)
+print("  " + hline(ML, MM, MR))
+
+for idx, (label, pct, pass_, fail, total, avg, mn, mx) in enumerate(rows):
+    if   pct >= 80: pct_color = GREEN
+    elif pct >= 60: pct_color = YELLOW
+    else:           pct_color = RED
+    winner_tag = f" {YELLOW}★{NC}" if idx == 0 and len(rows) > 1 else ""
+    row = (
+        V + f" {cell(label + winner_tag.replace(chr(27)+'[0m','').replace(chr(27)+'[1;33m','').replace('★',''), w_agent)} " +
+        V + f" {pct_color}{cell(str(pct)+'%', w_pct, '^')}{NC} " +
+        V + f" {cell(str(pass_), w_pass, '^')} " +
+        V + f" {cell(str(fail), w_fail, '^')} " +
+        V + f" {cell(str(total), w_total, '^')} " +
+        V + f" {cell(str(avg)+'s', w_avg, '^')} " +
+        V + f" {cell(str(mn)+'s', w_min, '^')} " +
+        V + f" {cell(str(mx)+'s', w_max, '^')} " + V
+    )
+    # Re-print with winner star for display
+    display_label = label + (f" {YELLOW}★{NC}" if idx == 0 and len(rows) > 1 else "")
+    row = (
+        V + f" {BOLD if idx == 0 else ''}{display_label:<{w_agent}}{NC} " +
+        V + f" {pct_color}{str(pct)+'%':^{w_pct}}{NC} " +
+        V + f" {str(pass_):^{w_pass}} " +
+        V + f" {str(fail):^{w_fail}} " +
+        V + f" {str(total):^{w_total}} " +
+        V + f" {str(avg)+'s':^{w_avg}} " +
+        V + f" {str(mn)+'s':^{w_min}} " +
+        V + f" {str(mx)+'s':^{w_max}} " + V
+    )
+    print("  " + row)
+
+print("  " + hline(BL, BM, BR))
+
+if rows:
+    winner = rows[0]
+    print()
+    print(f"  {BOLD}{GREEN}Winner: {winner[0]}{NC}  "
+          f"{GREEN}{winner[1]}% pass rate{NC}  "
+          f"{DIM}avg latency {winner[5]}s{NC}")
+    if len(rows) > 1 and rows[0][1] == rows[1][1]:
+        print(f"  {YELLOW}(Tie — winner has lower latency){NC}")
+print()
+PYBENCHMARK
+
+fi  # end QA/benchmark branch
 
 ok "Agent API test runs completed."
 
 fi  # end TEST_METHOD branch
 
-# ── Score results ──────────────────────────────────────────────────────────
+# ── Score results (QA mode only — benchmark already shows comparison table) ──
+if [ "${TEST_TYPE:-qa}" = "benchmark" ]; then
+    ok "Benchmark complete. See comparison table above."
+else
+
 echo ""
 info "Scoring results..."
 echo ""
@@ -3228,7 +3768,13 @@ for path in files:
                 if expected_topic != actual_topic:
                     topic_note = f" {YELLOW}(routed to: {actual_topic}){NC}"
 
-            print(f"  #{num:<3} [{tag}]  score={score_str}  topic={DIM}{topic}{NC}{topic_note}")
+            lat = tc.get("latency_ms", 0)
+            if lat:
+                lat_color = GREEN if lat < 3000 else YELLOW if lat < 8000 else RED
+                lat_str = f"  {DIM}[{lat_color}{lat/1000:.2f}s{NC}{DIM}]{NC}"
+            else:
+                lat_str = ""
+            print(f"  #{num:<3} [{tag}]  score={score_str}  topic={DIM}{topic}{NC}{topic_note}{lat_str}")
             print(f"       {DIM}\"{utterance}\"{NC}")
 
             if res != "PASS":
@@ -3242,7 +3788,11 @@ for path in files:
 
     suite_total = suite_pass + suite_fail
     suite_pct = (suite_pass * 100 // suite_total) if suite_total > 0 else 0
-    suite_results.append((suite, suite_pass, suite_total, suite_pct))
+    lats = [tc.get("latency_ms", 0) for tc in cases if tc.get("latency_ms")]
+    suite_avg_lat = int(sum(lats) / len(lats)) if lats else 0
+    suite_min_lat = min(lats) if lats else 0
+    suite_max_lat = max(lats) if lats else 0
+    suite_results.append((suite, suite_pass, suite_total, suite_pct, suite_avg_lat, suite_min_lat, suite_max_lat))
 
     pct_color = GREEN if suite_pct >= 80 else YELLOW if suite_pct >= 60 else RED
     print(f"  {BOLD}Suite total: {pct_color}{suite_pass}/{suite_total} ({suite_pct}%){NC}")
@@ -3255,12 +3805,17 @@ print(f"\n{BOLD}{CYAN}{'='*72}{NC}")
 print(f"{BOLD}  OVERALL RESULTS{NC}")
 print(f"{BOLD}{CYAN}{'='*72}{NC}")
 
-for suite, sp, st, spct in suite_results:
-    bar_len = 30
+for suite, sp, st, spct, avg_lat, min_lat, max_lat in suite_results:
+    bar_len = 20
     filled = int(bar_len * spct / 100) if st > 0 else 0
     bar = "█" * filled + "░" * (bar_len - filled)
     pct_color = GREEN if spct >= 80 else YELLOW if spct >= 60 else RED
-    print(f"  {suite:<40} {pct_color}{bar} {spct}%{NC} ({sp}/{st})")
+    if avg_lat:
+        lat_color = GREEN if avg_lat < 3000 else YELLOW if avg_lat < 8000 else RED
+        lat_part = f"  {DIM}avg:{lat_color}{avg_lat/1000:.2f}s{NC}{DIM} min:{min_lat/1000:.2f}s max:{max_lat/1000:.2f}s{NC}"
+    else:
+        lat_part = ""
+    print(f"  {suite:<38} {pct_color}{bar} {spct}%{NC} ({sp}/{st}){lat_part}")
 
 print()
 pct_color = GREEN if pct >= 80 else YELLOW if pct >= 60 else RED
@@ -3288,6 +3843,8 @@ print(f"  {DIM}Results saved to: {results_dir}/{NC}")
 print(f"{BOLD}{CYAN}{'='*72}{NC}")
 PYSCORE
 
+fi  # end: if not benchmark
+
 # ── Save run settings for --run lastrun ──────────────────────────────────────
 python3 - "$LAST_RUN_FILE" \
     "$AGENT_NAME" \
@@ -3299,6 +3856,9 @@ python3 - "$LAST_RUN_FILE" \
     "${LLM_API_KEY:-}" \
     "${AGENT_API_CONSUMER_KEY:-}" \
     "${AGENT_API_CONSUMER_SECRET:-}" \
+    "${AGENT_SESSION_MODE:-per_test}" \
+    "${AGENT_PARALLEL_MODE:-false}" \
+    "${AGENT_MAX_WORKERS:-3}" \
     "${GEN_ENGINE:-template}" \
     "${GEN_LLM_PROVIDER:-claude}" \
     "${GEN_LLM_MODEL:-}" \
@@ -3308,7 +3868,8 @@ last_run_file   = sys.argv[1]
 keys = [
     "LR_AGENT_NAME", "LR_ORG", "LR_TEST_METHOD", "LR_NUM_TESTS",
     "LR_LLM_PROVIDER", "LR_LLM_MODEL", "LR_LLM_API_KEY",
-    "LR_CONSUMER_KEY", "LR_CONSUMER_SECRET",
+    "LR_CONSUMER_KEY", "LR_CONSUMER_SECRET", "LR_SESSION_MODE",
+    "LR_PARALLEL_MODE", "LR_MAX_WORKERS",
     "LR_GEN_ENGINE", "LR_GEN_LLM_PROVIDER", "LR_GEN_LLM_MODEL", "LR_GEN_LLM_API_KEY",
 ]
 state = {k: v for k, v in zip(keys, sys.argv[2:])}
