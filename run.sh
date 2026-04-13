@@ -2632,6 +2632,29 @@ SFDXEOF
 cp "$SPECS_DIR"/*.aiEvaluationDefinition-meta.xml \
    "$DEPLOY_DIR/force-app/main/default/aiEvaluationDefinitions/"
 
+# Strip <contextVariables> blocks — Testing Center metadata API does not support
+# that element in AiEvaluationAgentTestCaseInput; Agent API reads them from
+# the source specs directly, so stripping only the deploy copies is safe.
+python3 - "$DEPLOY_DIR/force-app/main/default/aiEvaluationDefinitions" << 'PYSTRIP_CV'
+import sys, os, re
+deploy_dir = sys.argv[1]
+# Pattern matches a full <contextVariables>...</contextVariables> block (multiline)
+cv_pattern = re.compile(
+    r'\s*<contextVariables>.*?</contextVariables>',
+    re.DOTALL
+)
+for fname in os.listdir(deploy_dir):
+    if not fname.endswith('.xml'):
+        continue
+    fpath = os.path.join(deploy_dir, fname)
+    with open(fpath, 'r', encoding='utf-8') as f:
+        content = f.read()
+    stripped = cv_pattern.sub('', content)
+    if stripped != content:
+        with open(fpath, 'w', encoding='utf-8') as f:
+            f.write(stripped)
+PYSTRIP_CV
+
 info "Deploying ${TOTAL_SUITES} suite(s) to org..."
 
 DEPLOY_OUT=$(cd "$DEPLOY_DIR" && run_sf project deploy start \
