@@ -805,7 +805,7 @@ try:
         print(f'{fn}|{fid}|{lbl}')
 except Exception as e:
     print(f'ERROR|{e}', file=sys.stderr)
-" 2>/dev/null)
+" 2>/dev/null | tr -d '\r')
 
     if [ -z "$BOTS_PARSED" ]; then
         die "No agents found in this org. Make sure you have at least one Agentforce agent deployed."
@@ -815,6 +815,10 @@ except Exception as e:
     AGENT_IDS=()
     AGENT_LABELS=()
     while IFS='|' read -r name fid lbl; do
+        # Strip Windows CR (\r) that Python print() adds on Windows
+        name=$(printf '%s' "$name" | tr -d '\r')
+        fid=$(printf '%s' "$fid" | tr -d '\r')
+        lbl=$(printf '%s' "$lbl" | tr -d '\r')
         AGENT_NAMES+=("$name")
         AGENT_IDS+=("$fid")
         AGENT_LABELS+=("$lbl")
@@ -823,7 +827,7 @@ except Exception as e:
     echo ""
     echo -e "  ${BOLD}Available Agents:${NC} ${DIM}(ordered by last modified — most recent first)${NC}"
     for i in "${!AGENT_NAMES[@]}"; do
-        printf "    ${BOLD}%d)${NC} %s ${DIM}(%s)${NC}\n" "$((i+1))" "${AGENT_LABELS[$i]}" "${AGENT_NAMES[$i]}"
+        echo -e "    ${BOLD}$((i+1)))${NC} ${AGENT_LABELS[$i]} ${DIM}(${AGENT_NAMES[$i]})${NC}"
     done
 
     # ── Step 6: Select ───────────────────────────────────────────────────
