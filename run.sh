@@ -638,12 +638,13 @@ if [ "$DIRECT_MODE" = false ]; then
         # ── Obtain OAuth token via Client Credentials flow ──────────────────
         info "Authenticating via OAuth Client Credentials flow..."
 
-        AGENT_API_TOKEN=$(python3 -c "
-import urllib.request, urllib.parse, json, sys
+        _oauth_tmp=$(mktemp)
+        AGENT_API_TOKEN=$(python3 - "$ORG_INSTANCE" "$AGENT_API_CONSUMER_KEY" "$AGENT_API_CONSUMER_SECRET" 2>"$_oauth_tmp" << 'PYOAUTH'
+import urllib.request, urllib.parse, urllib.error, json, sys
 
-instance = '$ORG_INSTANCE'
-consumer_key = '$AGENT_API_CONSUMER_KEY'
-consumer_secret = '$AGENT_API_CONSUMER_SECRET'
+instance       = sys.argv[1]
+consumer_key   = sys.argv[2]
+consumer_secret= sys.argv[3]
 
 token_url = f'{instance}/services/oauth2/token'
 data = urllib.parse.urlencode({
@@ -662,14 +663,22 @@ try:
         if token:
             print(token)
         else:
-            print(f'ERROR:No access_token in response: {json.dumps(result)[:200]}', file=sys.stderr)
-            print('')
+            print(f'No access_token in response: {json.dumps(result)[:300]}', file=sys.stderr)
+except urllib.error.HTTPError as e:
+    body = e.read().decode(errors='replace')
+    try:
+        err = json.loads(body)
+        print(f'{err.get("error","HTTP error")}: {err.get("error_description", body[:200])}', file=sys.stderr)
+    except Exception:
+        print(f'HTTP {e.code}: {body[:200]}', file=sys.stderr)
 except Exception as e:
-    print(f'ERROR:{e}', file=sys.stderr)
-    print('')
-" 2>/dev/null)
+    print(f'{e}', file=sys.stderr)
+PYOAUTH
+)
+        _oauth_err=$(cat "$_oauth_tmp" | tr -d '\r'); rm -f "$_oauth_tmp"
 
         if [ -z "$AGENT_API_TOKEN" ]; then
+            echo -e "  ${RED}OAuth error: ${_oauth_err:-unknown error}${NC}"
             die "OAuth Client Credentials authentication failed. Check your Consumer Key, Consumer Secret, and that the External Client App is properly configured."
         fi
 
@@ -722,12 +731,13 @@ except:
     print('')
 " 2>/dev/null)
 
-        AGENT_API_TOKEN=$(python3 -c "
-import urllib.request, urllib.parse, json, sys
+        _oauth_tmp=$(mktemp)
+        AGENT_API_TOKEN=$(python3 - "$_DM_INSTANCE" "$AGENT_API_CONSUMER_KEY" "$AGENT_API_CONSUMER_SECRET" 2>"$_oauth_tmp" << 'PYOAUTH_DM'
+import urllib.request, urllib.parse, urllib.error, json, sys
 
-instance = '$_DM_INSTANCE'
-consumer_key = '$AGENT_API_CONSUMER_KEY'
-consumer_secret = '$AGENT_API_CONSUMER_SECRET'
+instance        = sys.argv[1]
+consumer_key    = sys.argv[2]
+consumer_secret = sys.argv[3]
 
 token_url = f'{instance}/services/oauth2/token'
 data = urllib.parse.urlencode({
@@ -742,13 +752,27 @@ req.add_header('Content-Type', 'application/x-www-form-urlencoded')
 try:
     with urllib.request.urlopen(req, timeout=30) as resp:
         result = json.loads(resp.read().decode())
-        print(result.get('access_token', ''))
+        token = result.get('access_token', '')
+        if token:
+            print(token)
+        else:
+            print(f'No access_token in response: {json.dumps(result)[:300]}', file=sys.stderr)
+except urllib.error.HTTPError as e:
+    body = e.read().decode(errors='replace')
+    try:
+        err = json.loads(body)
+        print(f'{err.get("error","HTTP error")}: {err.get("error_description", body[:200])}', file=sys.stderr)
+    except Exception:
+        print(f'HTTP {e.code}: {body[:200]}', file=sys.stderr)
 except Exception as e:
-    print('')
-" 2>/dev/null)
+    print(f'{e}', file=sys.stderr)
+PYOAUTH_DM
+)
+        _oauth_err=$(cat "$_oauth_tmp" | tr -d '\r'); rm -f "$_oauth_tmp"
 
         if [ -z "$AGENT_API_TOKEN" ]; then
-            die "OAuth Client Credentials authentication failed in direct mode."
+            echo -e "  ${RED}OAuth error: ${_oauth_err:-unknown error}${NC}"
+            die "OAuth Client Credentials authentication failed. Check Consumer Key, Secret, and External Client App config."
         fi
         info "Agent API OAuth token obtained."
     fi
