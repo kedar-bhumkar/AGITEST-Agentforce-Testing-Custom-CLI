@@ -3508,7 +3508,7 @@ else
     _labels_arg=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
 
     PYTHONIOENCODING=utf-8 python3 -X utf8 - "$_rdirs_arg" "$_labels_arg" << 'PYBENCHMARK'
-import sys, json, os, glob, io
+import sys, json, os, glob, io, re
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -3516,7 +3516,13 @@ if sys.stdout.encoding != 'utf-8':
 GREEN  = "\033[0;32m"; YELLOW = "\033[1;33m"; RED = "\033[0;31m"
 CYAN   = "\033[0;36m"; BOLD   = "\033[1m";    DIM = "\033[2m"; NC = "\033[0m"
 
-result_dirs  = sys.argv[1].split("|")
+def norm_path(p):
+    """Convert Git Bash /c/foo paths to C:/foo on Windows."""
+    if sys.platform == "win32":
+        p = re.sub(r'^/([a-zA-Z])/', lambda m: m.group(1).upper() + ':/', p)
+    return p
+
+result_dirs  = [norm_path(d) for d in sys.argv[1].split("|")]
 agent_labels = sys.argv[2].split("|")
 
 rows = []
@@ -3524,6 +3530,7 @@ for label, rdir in zip(agent_labels, result_dirs):
     files = glob.glob(os.path.join(rdir, "*.json"))
     total = pass_ = 0
     latencies = []
+    no_results = len(files) == 0
     for fpath in sorted(files):
         try:
             data = json.load(open(fpath, encoding="utf-8"))
@@ -3537,21 +3544,34 @@ for label, rdir in zip(agent_labels, result_dirs):
             for tr in tc.get("testResults", []):
                 if tr.get("name") == "output_validation" and tr.get("result") == "PASS":
                     pass_ += 1
-    pct     = round(pass_ / total * 100, 1) if total else 0.0
-    avg_lat = round(sum(latencies) / len(latencies) / 1000, 2) if latencies else 0.0
-    min_lat = round(min(latencies) / 1000, 2) if latencies else 0.0
-    max_lat = round(max(latencies) / 1000, 2) if latencies else 0.0
-    rows.append((label, pct, pass_, total - pass_, total, avg_lat, min_lat, max_lat))
+    pct     = round(pass_ / total * 100, 1) if total else None  # None = no data
+    avg_lat = round(sum(latencies) / len(latencies) / 1000, 2) if latencies else None
+    min_lat = round(min(latencies) / 1000, 2) if latencies else None
+    max_lat = round(max(latencies) / 1000, 2) if latencies else None
+    rows.append((label, pct, pass_, total - pass_, total, avg_lat, min_lat, max_lat, no_results))
 
-rows.sort(key=lambda r: -r[1])  # winner first
+# Sort: agents with results first (by pass%), then no-result agents last
+rows.sort(key=lambda r: (r[8], -(r[1] or 0)))  # no_results=True sorts last
 
-w_agent = max(len("Agent"), max((len(r[0]) for r in rows), default=5))
-cols    = [w_agent, 7, 4, 4, 5, 7, 6, 6]
+# For tie-breaking among agents with data: lower avg latency wins
+# (already handled by secondary sort key if needed)
+
+w_agent = max(len("Agent"), max((len(r[0]) for r in rows), default=5)) + 2  # +2 for " ★"
+cols    = [w_agent, 7, 4, 4, 5, 8, 7, 7]
 headers = ["Agent", "Pass%", "Pass", "Fail", "Total", "AvgLat", "Min", "Max"]
 H = "═"; V = "║"
 TL,TR,BL,BR = "╔","╗","╚","╝"; ML,MR = "╠","╣"; TM,BM,MM = "╦","╩","╬"
 
 def hline(l, m, r): return l + m.join(H*(c+2) for c in cols) + r
+
+def fmt_agent(label, is_winner, num_rows):
+    """Build agent cell of exactly w_agent visible chars (ANSI codes are zero-width)."""
+    if is_winner and num_rows > 1:
+        # label padded to (w_agent-2), then " ★" — total visible = w_agent
+        return f" {BOLD}{label:<{w_agent-2}}{NC} {YELLOW}★{NC} "
+    else:
+        # label padded to w_agent — total visible = w_agent
+        return f" {label:<{w_agent}} "
 
 print()
 print(f"  {BOLD}{CYAN}{'─── BENCHMARK COMPARISON ───':^{sum(cols)+len(cols)*3+len(cols)-1}}{NC}")
@@ -3559,27 +3579,38 @@ print("  " + hline(TL, TM, TR))
 print("  " + V + V.join(f" {h:^{cols[i]}} " for i,h in enumerate(headers)) + V)
 print("  " + hline(ML, MM, MR))
 
-for idx, (label, pct, pass_, fail, total, avg, mn, mx) in enumerate(rows):
-    pct_c = GREEN if pct >= 80 else YELLOW if pct >= 60 else RED
-    star  = f" {YELLOW}★{NC}" if idx == 0 and len(rows) > 1 else ""
-    b     = BOLD if idx == 0 else ""
+for idx, (label, pct, pass_, fail, total, avg, mn, mx, no_res) in enumerate(rows):
+    is_winner = (idx == 0 and not no_res)
+    pct_str  = f"{pct}%" if pct is not None else "N/A"
+    avg_str  = f"{avg}s"  if avg is not None else "N/A"
+    mn_str   = f"{mn}s"   if mn  is not None else "N/A"
+    mx_str   = f"{mx}s"   if mx  is not None else "N/A"
+    pct_c    = (GREEN if (pct or 0) >= 80 else YELLOW if (pct or 0) >= 60 else RED) if not no_res else DIM
+    note     = f"  {DIM}← no results (agent may be inactive){NC}" if no_res else ""
     print("  " + V +
-          f" {b}{label + star:<{w_agent}}{NC} " + V +
-          f" {pct_c}{str(pct)+'%':^7}{NC} " + V +
+          fmt_agent(label, is_winner, len(rows)) + V +
+          f" {pct_c}{pct_str:^7}{NC} " + V +
           f" {str(pass_):^4} " + V +
           f" {str(fail):^4} " + V +
           f" {str(total):^5} " + V +
-          f" {str(avg)+'s':^7} " + V +
-          f" {str(mn)+'s':^6} " + V +
-          f" {str(mx)+'s':^6} " + V)
+          f" {avg_str:^8} " + V +
+          f" {mn_str:^7} " + V +
+          f" {mx_str:^7} " + V +
+          note)
 
 print("  " + hline(BL, BM, BR))
 
-if rows:
-    w = rows[0]
-    print(f"\n  {BOLD}{GREEN}Winner: {w[0]}{NC}  {GREEN}{w[1]}% pass rate{NC}  {DIM}avg {w[5]}s latency{NC}")
-    if len(rows) > 1 and rows[0][1] == rows[1][1]:
+# Winner = first agent with actual results
+winners = [r for r in rows if not r[8]]
+if winners:
+    w = winners[0]
+    pct_disp = f"{w[1]}%" if w[1] is not None else "N/A"
+    avg_disp = f"{w[5]}s" if w[5] is not None else "N/A"
+    print(f"\n  {BOLD}{GREEN}Winner: {w[0]}{NC}  {GREEN}{pct_disp} pass rate{NC}  {DIM}avg {avg_disp} latency{NC}")
+    if len(winners) > 1 and winners[0][1] == winners[1][1]:
         print(f"  {YELLOW}(Tie — winner has lower avg latency){NC}")
+elif rows:
+    print(f"\n  {YELLOW}No agents produced results — check that agents are active and published.{NC}")
 print()
 PYBENCHMARK
 
