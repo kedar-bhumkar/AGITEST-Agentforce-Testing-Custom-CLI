@@ -120,10 +120,17 @@ PYLASTRUN
                 # Benchmark-specific fields
                 [ -n "${LR_TEST_TYPE:-}"            ] && TEST_TYPE="$LR_TEST_TYPE"
                 [ -n "${LR_BENCHMARK_EXECUTION:-}"  ] && BENCHMARK_EXECUTION="$LR_BENCHMARK_EXECUTION"
-                if [ "${LR_TEST_TYPE:-}" = "benchmark" ] && [ -n "${LR_BENCHMARK_NAMES:-}" ]; then
+                if [ "${LR_TEST_TYPE:-}" = "benchmark" ]; then
+                    if [ -z "${LR_BENCHMARK_NAMES:-}" ]; then
+                        echo -e "  \033[0;31mERROR: This .last_run.json was saved before benchmark support was added.\033[0m"
+                        echo -e "  \033[2mPlease run a fresh benchmark interactively first, then use --run lastrun.\033[0m"
+                        exit 1
+                    fi
                     IFS='|' read -ra BENCHMARK_AGENT_NAMES  <<< "${LR_BENCHMARK_NAMES}"
                     IFS='|' read -ra BENCHMARK_AGENT_IDS    <<< "${LR_BENCHMARK_IDS}"
                     IFS='|' read -ra BENCHMARK_AGENT_LABELS <<< "${LR_BENCHMARK_LABELS}"
+                    # Benchmark always uses Agent API
+                    TEST_METHOD="agent_api"
                 fi
                 # Summary display
                 echo -e "  \033[2mOrg:    ${ORG:-<from default>}\033[0m"
@@ -319,7 +326,14 @@ else
     echo ""
     echo -e "${BOLD}${CYAN}AGENTFORCE TEST KIT — Direct Mode${NC}"
     echo -e "${DIM}──────────────────────────────────────────────────────────────────────${NC}"
-    echo -e "  Agent: ${BOLD}${DIRECT_BOT}${NC}  Tests/topic: ${BOLD}${NUM_TESTS}${NC}"
+    if [ "${TEST_TYPE:-qa}" = "benchmark" ] && [ "${#BENCHMARK_AGENT_NAMES[@]}" -ge 2 ]; then
+        echo -e "  Mode: ${BOLD}Benchmark${NC}  (${#BENCHMARK_AGENT_NAMES[@]} agents, ${BENCHMARK_EXECUTION:-serial})  Tests/topic: ${BOLD}${NUM_TESTS}${NC}"
+        for _bi in "${!BENCHMARK_AGENT_NAMES[@]}"; do
+            echo -e "  ${DIM}  $((${_bi}+1))) ${BENCHMARK_AGENT_LABELS[$_bi]} (${BENCHMARK_AGENT_NAMES[$_bi]})${NC}"
+        done
+    else
+        echo -e "  Agent: ${BOLD}${DIRECT_BOT}${NC}  Tests/topic: ${BOLD}${NUM_TESTS}${NC}"
+    fi
 fi
 
 # ── Preflight: check tools ──────────────────────────────────────────────────
@@ -678,8 +692,11 @@ except Exception as e:
         done
     fi
 else
-    # Direct mode: default to testing_center if not specified
-    if [ -z "$TEST_METHOD" ]; then
+    # Direct mode: default to testing_center if not specified.
+    # Benchmark mode always requires agent_api regardless of saved value.
+    if [ "${TEST_TYPE:-qa}" = "benchmark" ]; then
+        TEST_METHOD="agent_api"
+    elif [ -z "$TEST_METHOD" ]; then
         TEST_METHOD="testing_center"
     fi
     info "Testing method: $TEST_METHOD"
