@@ -838,11 +838,10 @@ except Exception as e:
     # ── Step 6: Select ───────────────────────────────────────────────────
     step 6 14 "Select Agent"
 
-    # Helper: query and display BotVersion info for a given BotDefinition ID
-    # Prints: vN [Status] (colored), sets caller's _bv_id and _bv_status_out
+    # Helper: query BotVersion and display info; sets _bv_id in caller
     _show_bot_version() {
         local _def_id="$1" _label="$2"
-        local _vf=$(mktemp)
+        local _vf; _vf=$(mktemp)
         run_sf data query \
             --query "SELECT Id, VersionNumber, Status FROM BotVersion WHERE BotDefinitionId = '${_def_id}' ORDER BY VersionNumber DESC LIMIT 1" \
             --target-org "$ORG" --json > "$_vf" 2>/dev/null &
@@ -862,6 +861,7 @@ except:
     print('none||')
 " 2>/dev/null)
         rm -f "$_vf"
+        local _vnum _vstatus _vid
         IFS='|' read -r _vnum _vstatus _vid <<< "$_vi"
         _bv_id="$_vid"
         if [ "$_vnum" = "none" ]; then
@@ -940,17 +940,17 @@ except:
         echo ""
         ok "Benchmark agents (${#BENCHMARK_AGENT_NAMES[@]}):"
         _bv_id=""
+        _first_bv_id=""
         for i in "${!BENCHMARK_AGENT_NAMES[@]}"; do
             _show_bot_version "${BENCHMARK_AGENT_IDS[$i]}" "${BENCHMARK_AGENT_LABELS[$i]}"
-            # Capture first agent's BotVersion ID for topic discovery
-            [ "$i" -eq 0 ] && { _first_bv_id="$_bv_id"; }
+            [ "$i" -eq 0 ] && _first_bv_id="$_bv_id"
         done
         _bv_id="$_first_bv_id"
 
         # Benchmark execution mode
         echo ""
         echo -e "  ${BOLD}Run agents:${NC}"
-        echo -e "    ${BOLD}a)${NC} Serial    ${DIM}(agents run one after another — output interleaved)${NC}"
+        echo -e "    ${BOLD}a)${NC} Serial    ${DIM}(agents run one after another)${NC}"
         echo -e "    ${BOLD}b)${NC} Parallel  ${DIM}(agents run simultaneously)${NC}"
         echo ""
         read -p "  Select (a/b) [default: a]: " _exec_choice
@@ -2850,7 +2850,7 @@ for xml in "${SPEC_FILES[@]}"; do
     fi
 done
 
-# Save Python runner to a temp file so it can be called multiple times (benchmark)
+# Save Python runner to a temp file so it can be called once per agent (benchmark)
 _py_runner=$(mktemp --suffix=.py)
 cat > "$_py_runner" << 'PYAGENTAPI'
 import sys, json, time, os, uuid, html, io, threading
@@ -3461,7 +3461,7 @@ else:
 print(f"\n  {GREEN}All Agent API test runs completed.{NC}")
 PYAGENTAPI
 
-# ── QA mode: single agent run ────────────────────────────────────────────────
+# ── QA mode: single agent ────────────────────────────────────────────────────
 if [ "$TEST_TYPE" != "benchmark" ]; then
     PYTHONIOENCODING=utf-8 python3 -X utf8 "$_py_runner" \
         "$RUN_ACCESS_TOKEN" "$RUN_INSTANCE_URL" "$AGENT_BOT_ID" "$RESULTS_DIR" \
@@ -3469,7 +3469,7 @@ if [ "$TEST_TYPE" != "benchmark" ]; then
         "${AGENT_SESSION_MODE:-per_test}" "${AGENT_PARALLEL_MODE:-false}" "${AGENT_MAX_WORKERS:-3}"
     rm -f "$_py_runner"
 
-# ── Benchmark mode: run each agent, then compare ─────────────────────────────
+# ── Benchmark mode: run each agent, then show comparison ─────────────────────
 else
     BENCHMARK_PIDS=()
     BENCHMARK_RESULT_DIRS=()
@@ -3484,7 +3484,7 @@ else
         BENCHMARK_RESULT_DIRS+=("$_rdir")
 
         echo ""
-        info "[$((${_bi}+1))/${#BENCHMARK_AGENT_NAMES[@]}] Running: ${_blabel} (${_bname})..."
+        info "[$((${_bi}+1))/${#BENCHMARK_AGENT_NAMES[@]}] Running tests for: ${_blabel}..."
 
         if [ "$BENCHMARK_EXECUTION" = "parallel" ]; then
             PYTHONIOENCODING=utf-8 python3 -X utf8 "$_py_runner" \
@@ -3507,7 +3507,7 @@ else
 
     rm -f "$_py_runner"
 
-    # ── Benchmark comparison table ────────────────────────────────────────
+    # ── Comparison table ─────────────────────────────────────────────────
     echo ""
     _rdirs_arg=$(IFS='|'; echo "${BENCHMARK_RESULT_DIRS[*]}")
     _labels_arg=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
@@ -3518,13 +3518,8 @@ import sys, json, os, glob, io
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-GREEN  = "\033[0;32m"
-YELLOW = "\033[1;33m"
-RED    = "\033[0;31m"
-CYAN   = "\033[0;36m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-NC     = "\033[0m"
+GREEN  = "\033[0;32m"; YELLOW = "\033[1;33m"; RED = "\033[0;31m"
+CYAN   = "\033[0;36m"; BOLD   = "\033[1m";    DIM = "\033[2m"; NC = "\033[0m"
 
 result_dirs  = sys.argv[1].split("|")
 agent_labels = sys.argv[2].split("|")
@@ -3553,80 +3548,43 @@ for label, rdir in zip(agent_labels, result_dirs):
     max_lat = round(max(latencies) / 1000, 2) if latencies else 0.0
     rows.append((label, pct, pass_, total - pass_, total, avg_lat, min_lat, max_lat))
 
-# Sort by pass % descending (winner first)
-rows.sort(key=lambda r: -r[1])
+rows.sort(key=lambda r: -r[1])  # winner first
 
-# Column widths
-w_agent = max(len("Agent"), max((len(r[0]) for r in rows), default=0))
-w_pct   = 7   # "100.0%"
-w_pass  = 4
-w_fail  = 4
-w_total = 5
-w_avg   = 7
-w_min   = 6
-w_max   = 6
+w_agent = max(len("Agent"), max((len(r[0]) for r in rows), default=5))
+cols    = [w_agent, 7, 4, 4, 5, 7, 6, 6]
+headers = ["Agent", "Pass%", "Pass", "Fail", "Total", "AvgLat", "Min", "Max"]
+H = "═"; V = "║"
+TL,TR,BL,BR = "╔","╗","╚","╝"; ML,MR = "╠","╣"; TM,BM,MM = "╦","╩","╬"
 
-def cell(val, width, align="<"):
-    return f"{val:{align}{width}}"
-
-# Box chars
-TL, TR, BL, BR = "╔", "╗", "╚", "╝"
-ML, MR         = "╠", "╣"
-TM, BM, MM     = "╦", "╩", "╬"
-H, V           = "═", "║"
-
-cols = [w_agent, w_pct, w_pass, w_fail, w_total, w_avg, w_min, w_max]
-headers = ["Agent", "Pass%", "Pass", "Fail", "Total", "Avg Lat", "Min", "Max"]
-
-def hline(left, mid, right, fill=H):
-    return left + mid.join(fill * (c + 2) for c in cols) + right
+def hline(l, m, r): return l + m.join(H*(c+2) for c in cols) + r
 
 print()
-print(f"  {BOLD}{CYAN}{'BENCHMARK COMPARISON':^{sum(cols) + len(cols)*3 + len(cols)-1}}{NC}")
+print(f"  {BOLD}{CYAN}{'─── BENCHMARK COMPARISON ───':^{sum(cols)+len(cols)*3+len(cols)-1}}{NC}")
 print("  " + hline(TL, TM, TR))
-hdr = V + V.join(f" {cell(h, cols[i], '^')} " for i, h in enumerate(headers)) + V
-print("  " + hdr)
+print("  " + V + V.join(f" {h:^{cols[i]}} " for i,h in enumerate(headers)) + V)
 print("  " + hline(ML, MM, MR))
 
 for idx, (label, pct, pass_, fail, total, avg, mn, mx) in enumerate(rows):
-    if   pct >= 80: pct_color = GREEN
-    elif pct >= 60: pct_color = YELLOW
-    else:           pct_color = RED
-    winner_tag = f" {YELLOW}★{NC}" if idx == 0 and len(rows) > 1 else ""
-    row = (
-        V + f" {cell(label + winner_tag.replace(chr(27)+'[0m','').replace(chr(27)+'[1;33m','').replace('★',''), w_agent)} " +
-        V + f" {pct_color}{cell(str(pct)+'%', w_pct, '^')}{NC} " +
-        V + f" {cell(str(pass_), w_pass, '^')} " +
-        V + f" {cell(str(fail), w_fail, '^')} " +
-        V + f" {cell(str(total), w_total, '^')} " +
-        V + f" {cell(str(avg)+'s', w_avg, '^')} " +
-        V + f" {cell(str(mn)+'s', w_min, '^')} " +
-        V + f" {cell(str(mx)+'s', w_max, '^')} " + V
-    )
-    # Re-print with winner star for display
-    display_label = label + (f" {YELLOW}★{NC}" if idx == 0 and len(rows) > 1 else "")
-    row = (
-        V + f" {BOLD if idx == 0 else ''}{display_label:<{w_agent}}{NC} " +
-        V + f" {pct_color}{str(pct)+'%':^{w_pct}}{NC} " +
-        V + f" {str(pass_):^{w_pass}} " +
-        V + f" {str(fail):^{w_fail}} " +
-        V + f" {str(total):^{w_total}} " +
-        V + f" {str(avg)+'s':^{w_avg}} " +
-        V + f" {str(mn)+'s':^{w_min}} " +
-        V + f" {str(mx)+'s':^{w_max}} " + V
-    )
-    print("  " + row)
+    pct_c = GREEN if pct >= 80 else YELLOW if pct >= 60 else RED
+    star  = f" {YELLOW}★{NC}" if idx == 0 and len(rows) > 1 else ""
+    b     = BOLD if idx == 0 else ""
+    print("  " + V +
+          f" {b}{label + star:<{w_agent}}{NC} " + V +
+          f" {pct_c}{str(pct)+'%':^7}{NC} " + V +
+          f" {str(pass_):^4} " + V +
+          f" {str(fail):^4} " + V +
+          f" {str(total):^5} " + V +
+          f" {str(avg)+'s':^7} " + V +
+          f" {str(mn)+'s':^6} " + V +
+          f" {str(mx)+'s':^6} " + V)
 
 print("  " + hline(BL, BM, BR))
 
 if rows:
-    winner = rows[0]
-    print()
-    print(f"  {BOLD}{GREEN}Winner: {winner[0]}{NC}  "
-          f"{GREEN}{winner[1]}% pass rate{NC}  "
-          f"{DIM}avg latency {winner[5]}s{NC}")
+    w = rows[0]
+    print(f"\n  {BOLD}{GREEN}Winner: {w[0]}{NC}  {GREEN}{w[1]}% pass rate{NC}  {DIM}avg {w[5]}s latency{NC}")
     if len(rows) > 1 and rows[0][1] == rows[1][1]:
-        print(f"  {YELLOW}(Tie — winner has lower latency){NC}")
+        print(f"  {YELLOW}(Tie — winner has lower avg latency){NC}")
 print()
 PYBENCHMARK
 
@@ -3636,9 +3594,9 @@ ok "Agent API test runs completed."
 
 fi  # end TEST_METHOD branch
 
-# ── Score results (QA mode only — benchmark already shows comparison table) ──
+# ── Score results (QA only — benchmark already showed comparison table) ──────
 if [ "${TEST_TYPE:-qa}" = "benchmark" ]; then
-    ok "Benchmark complete. See comparison table above."
+    ok "Benchmark complete. See comparison table above for full results."
 else
 
 echo ""
