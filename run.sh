@@ -117,11 +117,27 @@ PYLASTRUN
                 [ -n "${LR_GEN_LLM_PROVIDER:-}" ] && GEN_LLM_PROVIDER="$LR_GEN_LLM_PROVIDER"
                 [ -n "${LR_GEN_LLM_MODEL:-}"    ] && GEN_LLM_MODEL="$LR_GEN_LLM_MODEL"
                 [ -n "${LR_GEN_LLM_API_KEY:-}"  ] && GEN_LLM_API_KEY="$LR_GEN_LLM_API_KEY"
-                echo -e "  \033[2mAgent:  $DIRECT_BOT\033[0m"
+                # Benchmark-specific fields
+                [ -n "${LR_TEST_TYPE:-}"            ] && TEST_TYPE="$LR_TEST_TYPE"
+                [ -n "${LR_BENCHMARK_EXECUTION:-}"  ] && BENCHMARK_EXECUTION="$LR_BENCHMARK_EXECUTION"
+                if [ "${LR_TEST_TYPE:-}" = "benchmark" ] && [ -n "${LR_BENCHMARK_NAMES:-}" ]; then
+                    IFS='|' read -ra BENCHMARK_AGENT_NAMES  <<< "${LR_BENCHMARK_NAMES}"
+                    IFS='|' read -ra BENCHMARK_AGENT_IDS    <<< "${LR_BENCHMARK_IDS}"
+                    IFS='|' read -ra BENCHMARK_AGENT_LABELS <<< "${LR_BENCHMARK_LABELS}"
+                fi
+                # Summary display
                 echo -e "  \033[2mOrg:    ${ORG:-<from default>}\033[0m"
                 echo -e "  \033[2mMethod: ${TEST_METHOD:-testing_center}\033[0m"
                 echo -e "  \033[2mLLM:    ${LLM_PROVIDER:-} ${LLM_MODEL:-}\033[0m"
                 echo -e "  \033[2mTests:  ${NUM_TESTS:-10} per topic\033[0m"
+                if [ "${TEST_TYPE:-qa}" = "benchmark" ] && [ "${#BENCHMARK_AGENT_NAMES[@]}" -ge 2 ]; then
+                    echo -e "  \033[2mMode:   benchmark (${#BENCHMARK_AGENT_NAMES[@]} agents, ${BENCHMARK_EXECUTION:-serial})\033[0m"
+                    for _i in "${!BENCHMARK_AGENT_NAMES[@]}"; do
+                        echo -e "  \033[2m  $((${_i}+1))) ${BENCHMARK_AGENT_LABELS[$_i]} (${BENCHMARK_AGENT_NAMES[$_i]})\033[0m"
+                    done
+                else
+                    echo -e "  \033[2mAgent:  $DIRECT_BOT\033[0m"
+                fi
                 echo ""
             fi
             shift 2
@@ -957,9 +973,21 @@ except:
     fi
 else
     # Direct mode: agent already set from --run arg
-    SELECTED_BOT_DEF_ID=""
-    _bv_id=""
-    info "Agent: $AGENT_NAME"
+    if [ "$TEST_TYPE" = "benchmark" ] && [ "${#BENCHMARK_AGENT_NAMES[@]}" -ge 2 ]; then
+        # Benchmark lastrun: arrays already restored; wire up primary agent for topic discovery
+        AGENT_NAME="${BENCHMARK_AGENT_NAMES[0]}"
+        SELECTED_BOT_DEF_ID="${BENCHMARK_AGENT_IDS[0]}"
+        _bv_id=""
+        ok "Benchmark agents (${#BENCHMARK_AGENT_NAMES[@]}) from last run:"
+        for _bi in "${!BENCHMARK_AGENT_NAMES[@]}"; do
+            info "  $((${_bi}+1))) ${BENCHMARK_AGENT_LABELS[$_bi]} (${BENCHMARK_AGENT_NAMES[$_bi]})"
+        done
+        info "Execution: ${BENCHMARK_EXECUTION:-serial}"
+    else
+        SELECTED_BOT_DEF_ID=""
+        _bv_id=""
+        info "Agent: $AGENT_NAME"
+    fi
 fi
 
 # ── Resolve Agent Bot ID for Agent API path ─────────────────────────────────
@@ -3830,6 +3858,9 @@ PYSCORE
 fi  # end: if not benchmark
 
 # ── Save run settings for --run lastrun ──────────────────────────────────────
+_lr_benchmark_names=$(IFS='|'; echo "${BENCHMARK_AGENT_NAMES[*]}")
+_lr_benchmark_ids=$(IFS='|'; echo "${BENCHMARK_AGENT_IDS[*]}")
+_lr_benchmark_labels=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
 python3 - "$LAST_RUN_FILE" \
     "$AGENT_NAME" \
     "${ORG:-}" \
@@ -3846,7 +3877,12 @@ python3 - "$LAST_RUN_FILE" \
     "${GEN_ENGINE:-template}" \
     "${GEN_LLM_PROVIDER:-claude}" \
     "${GEN_LLM_MODEL:-}" \
-    "${GEN_LLM_API_KEY:-}" << 'PYSAVELASTRUN'
+    "${GEN_LLM_API_KEY:-}" \
+    "${TEST_TYPE:-qa}" \
+    "${_lr_benchmark_names:-}" \
+    "${_lr_benchmark_ids:-}" \
+    "${_lr_benchmark_labels:-}" \
+    "${BENCHMARK_EXECUTION:-serial}" << 'PYSAVELASTRUN'
 import json, sys
 last_run_file   = sys.argv[1]
 keys = [
@@ -3855,6 +3891,9 @@ keys = [
     "LR_CONSUMER_KEY", "LR_CONSUMER_SECRET", "LR_SESSION_MODE",
     "LR_PARALLEL_MODE", "LR_MAX_WORKERS",
     "LR_GEN_ENGINE", "LR_GEN_LLM_PROVIDER", "LR_GEN_LLM_MODEL", "LR_GEN_LLM_API_KEY",
+    "LR_TEST_TYPE",
+    "LR_BENCHMARK_NAMES", "LR_BENCHMARK_IDS", "LR_BENCHMARK_LABELS",
+    "LR_BENCHMARK_EXECUTION",
 ]
 state = {k: v for k, v in zip(keys, sys.argv[2:])}
 with open(last_run_file, 'w') as f:
