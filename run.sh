@@ -1655,8 +1655,10 @@ except Exception as e:
 fi  # end interactive steps 9-10
 
 # ── Save run settings for --run lastrun ──────────────────────────────────────
-# Saved HERE (before testing begins) so settings are preserved even if
-# testing fails (deploy error, API error, etc.) — not just on success.
+# Only saved from INTERACTIVE runs (DIRECT_MODE=false). Saving from a
+# --run lastrun replay would overwrite the JSON with the replayed (possibly
+# wrong) values, creating a feedback loop. Interactive runs only.
+if [ "$DIRECT_MODE" = false ]; then
 _lr_benchmark_names=$(IFS='|'; echo "${BENCHMARK_AGENT_NAMES[*]}")
 _lr_benchmark_ids=$(IFS='|'; echo "${BENCHMARK_AGENT_IDS[*]}")
 _lr_benchmark_labels=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
@@ -1699,6 +1701,7 @@ with open(last_run_file, 'w') as f:
     json.dump(state, f, indent=2)
 print(f"  Settings saved to .last_run.json (use --run lastrun to repeat)")
 PYSAVELASTRUN
+fi  # end: only save from interactive mode
 
 # ============================================================================
 # STEP 11: Generate AiEvaluationDefinition XML files
