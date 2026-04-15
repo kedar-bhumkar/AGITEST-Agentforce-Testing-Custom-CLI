@@ -1654,55 +1654,6 @@ except Exception as e:
     fi
 fi  # end interactive steps 9-10
 
-# ── Save run settings for --run lastrun ──────────────────────────────────────
-# Only saved from INTERACTIVE runs (DIRECT_MODE=false). Saving from a
-# --run lastrun replay would overwrite the JSON with the replayed (possibly
-# wrong) values, creating a feedback loop. Interactive runs only.
-if [ "$DIRECT_MODE" = false ]; then
-_lr_benchmark_names=$(IFS='|'; echo "${BENCHMARK_AGENT_NAMES[*]}")
-_lr_benchmark_ids=$(IFS='|'; echo "${BENCHMARK_AGENT_IDS[*]}")
-_lr_benchmark_labels=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
-python3 - "$LAST_RUN_FILE" \
-    "$AGENT_NAME" \
-    "${ORG:-}" \
-    "${TEST_METHOD:-testing_center}" \
-    "${NUM_TESTS:-10}" \
-    "${LLM_PROVIDER:-}" \
-    "${LLM_MODEL:-}" \
-    "${LLM_API_KEY:-}" \
-    "${AGENT_API_CONSUMER_KEY:-}" \
-    "${AGENT_API_CONSUMER_SECRET:-}" \
-    "${AGENT_SESSION_MODE:-per_test}" \
-    "${AGENT_PARALLEL_MODE:-false}" \
-    "${AGENT_MAX_WORKERS:-3}" \
-    "${GEN_ENGINE:-template}" \
-    "${GEN_LLM_PROVIDER:-claude}" \
-    "${GEN_LLM_MODEL:-}" \
-    "${GEN_LLM_API_KEY:-}" \
-    "${TEST_TYPE:-qa}" \
-    "${_lr_benchmark_names:-}" \
-    "${_lr_benchmark_ids:-}" \
-    "${_lr_benchmark_labels:-}" \
-    "${BENCHMARK_EXECUTION:-serial}" << 'PYSAVELASTRUN'
-import json, sys
-last_run_file   = sys.argv[1]
-keys = [
-    "LR_AGENT_NAME", "LR_ORG", "LR_TEST_METHOD", "LR_NUM_TESTS",
-    "LR_LLM_PROVIDER", "LR_LLM_MODEL", "LR_LLM_API_KEY",
-    "LR_CONSUMER_KEY", "LR_CONSUMER_SECRET", "LR_SESSION_MODE",
-    "LR_PARALLEL_MODE", "LR_MAX_WORKERS",
-    "LR_GEN_ENGINE", "LR_GEN_LLM_PROVIDER", "LR_GEN_LLM_MODEL", "LR_GEN_LLM_API_KEY",
-    "LR_TEST_TYPE",
-    "LR_BENCHMARK_NAMES", "LR_BENCHMARK_IDS", "LR_BENCHMARK_LABELS",
-    "LR_BENCHMARK_EXECUTION",
-]
-state = {k: v for k, v in zip(keys, sys.argv[2:])}
-with open(last_run_file, 'w') as f:
-    json.dump(state, f, indent=2)
-print(f"  Settings saved to .last_run.json (use --run lastrun to repeat)")
-PYSAVELASTRUN
-fi  # end: only save from interactive mode
-
 # ============================================================================
 # STEP 11: Generate AiEvaluationDefinition XML files
 # ============================================================================
@@ -2597,9 +2548,27 @@ except Exception as e:
             fi
         fi
     else
-        # Direct mode: validate LLM provider is set
+        # Direct mode: prompt for LLM provider if not restored from lastrun
         if [ -z "$LLM_PROVIDER" ]; then
-            die "Agent API method requires --llm <provider>. Options: openai, claude, gemini, ollama"
+            echo ""
+            warn "LLM provider not found in last run settings. Please select one now."
+            echo ""
+            echo -e "  ${BOLD}Select LLM evaluator:${NC}"
+            echo -e "    ${BOLD}1)${NC} Claude  ${DIM}(Anthropic — recommended)${NC}"
+            echo -e "    ${BOLD}2)${NC} OpenAI  ${DIM}(GPT-4o)${NC}"
+            echo -e "    ${BOLD}3)${NC} Gemini  ${DIM}(Google)${NC}"
+            echo -e "    ${BOLD}4)${NC} Ollama  ${DIM}(local)${NC}"
+            echo ""
+            while true; do
+                read -p "  Select (1-4): " _llm_choice
+                case "$_llm_choice" in
+                    1) LLM_PROVIDER="claude";  break ;;
+                    2) LLM_PROVIDER="openai";  break ;;
+                    3) LLM_PROVIDER="gemini";  break ;;
+                    4) LLM_PROVIDER="ollama";  break ;;
+                    *) echo -e "  ${RED}Enter 1, 2, 3, or 4.${NC}" ;;
+                esac
+            done
         fi
 
         # Set default models if not specified
@@ -2625,7 +2594,14 @@ except Exception as e:
         esac
 
         if [ "$LLM_PROVIDER" != "ollama" ] && [ -z "$LLM_API_KEY" ]; then
-            die "No API key for $LLM_PROVIDER. Use --llm-key or set the appropriate env var."
+            echo ""
+            warn "No API key for $LLM_PROVIDER found in last run settings."
+            read -p "  Enter $LLM_PROVIDER API key: " _llm_key_input
+            _llm_key_input=$(echo "$_llm_key_input" | tr -d '\r')
+            if [ -z "$_llm_key_input" ]; then
+                die "API key is required for $LLM_PROVIDER."
+            fi
+            LLM_API_KEY="$_llm_key_input"
         fi
 
         # Direct mode defaults
@@ -2635,6 +2611,56 @@ except Exception as e:
         info "LLM: $LLM_PROVIDER ($LLM_MODEL)"
     fi
 fi
+
+# ── Save run settings for --run lastrun ──────────────────────────────────────
+# Placed here (after step 12 LLM selection) so LLM_PROVIDER is fully set.
+# Only saved from INTERACTIVE runs (DIRECT_MODE=false). Saving from a
+# --run lastrun replay would overwrite the JSON with the replayed (possibly
+# wrong) values, creating a feedback loop. Interactive runs only.
+if [ "$DIRECT_MODE" = false ]; then
+_lr_benchmark_names=$(IFS='|'; echo "${BENCHMARK_AGENT_NAMES[*]}")
+_lr_benchmark_ids=$(IFS='|'; echo "${BENCHMARK_AGENT_IDS[*]}")
+_lr_benchmark_labels=$(IFS='|'; echo "${BENCHMARK_AGENT_LABELS[*]}")
+python3 - "$LAST_RUN_FILE" \
+    "$AGENT_NAME" \
+    "${ORG:-}" \
+    "${TEST_METHOD:-testing_center}" \
+    "${NUM_TESTS:-10}" \
+    "${LLM_PROVIDER:-}" \
+    "${LLM_MODEL:-}" \
+    "${LLM_API_KEY:-}" \
+    "${AGENT_API_CONSUMER_KEY:-}" \
+    "${AGENT_API_CONSUMER_SECRET:-}" \
+    "${AGENT_SESSION_MODE:-per_test}" \
+    "${AGENT_PARALLEL_MODE:-false}" \
+    "${AGENT_MAX_WORKERS:-3}" \
+    "${GEN_ENGINE:-template}" \
+    "${GEN_LLM_PROVIDER:-claude}" \
+    "${GEN_LLM_MODEL:-}" \
+    "${GEN_LLM_API_KEY:-}" \
+    "${TEST_TYPE:-qa}" \
+    "${_lr_benchmark_names:-}" \
+    "${_lr_benchmark_ids:-}" \
+    "${_lr_benchmark_labels:-}" \
+    "${BENCHMARK_EXECUTION:-serial}" << 'PYSAVELASTRUN'
+import json, sys
+last_run_file   = sys.argv[1]
+keys = [
+    "LR_AGENT_NAME", "LR_ORG", "LR_TEST_METHOD", "LR_NUM_TESTS",
+    "LR_LLM_PROVIDER", "LR_LLM_MODEL", "LR_LLM_API_KEY",
+    "LR_CONSUMER_KEY", "LR_CONSUMER_SECRET", "LR_SESSION_MODE",
+    "LR_PARALLEL_MODE", "LR_MAX_WORKERS",
+    "LR_GEN_ENGINE", "LR_GEN_LLM_PROVIDER", "LR_GEN_LLM_MODEL", "LR_GEN_LLM_API_KEY",
+    "LR_TEST_TYPE",
+    "LR_BENCHMARK_NAMES", "LR_BENCHMARK_IDS", "LR_BENCHMARK_LABELS",
+    "LR_BENCHMARK_EXECUTION",
+]
+state = {k: v for k, v in zip(keys, sys.argv[2:])}
+with open(last_run_file, 'w') as f:
+    json.dump(state, f, indent=2)
+print(f"  Settings saved to .last_run.json (use --run lastrun to repeat)")
+PYSAVELASTRUN
+fi  # end: only save from interactive mode
 
 # ============================================================================
 # STEP 13: Confirm Execution
